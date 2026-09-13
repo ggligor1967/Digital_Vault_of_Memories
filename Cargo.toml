@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["apps/desktop/src-tauri", "crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "SEE LICENSE IN SECURITY.md"
+publish = false
+repository = "https://github.com/ggligor/digital-vault-of-memories"
+
+[workspace.dependencies]
+# --- Internal crates -------------------------------------------------------
+dvm-domain = { path = "crates/dvm-domain" }
+dvm-application = { path = "crates/dvm-application" }
+dvm-observability = { path = "crates/dvm-observability" }
+
+# --- Third party (pinned to exact versions; see docs/release-evidence) ------
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tauri = { version = "=2.11.5", features = [] }
+tauri-build = { version = "=2.6.3", features = [] }
+uuid = { version = "=1.26.1", features = ["v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Blueprint v2 §55 / INV-004: the trusted backend must never terminate the
+# process or fabricate a value on an error path.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+# Deterministic, size-conscious release profile for the desktop shell.
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

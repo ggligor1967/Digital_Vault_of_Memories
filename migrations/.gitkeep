@@ -1,0 +1,7 @@
+# Reserved by the canonical repository topology of Blueprint v2 §7.
+#
+# SQLite schema migrations. Authorised from gate G3 (migration framework); the first migration arrives with the encrypted database in G1.
+#
+# This placeholder exists only so that a clean `git clone` reconstructs the
+# intended topology. Delete it in the same change that adds the first real
+# file here.

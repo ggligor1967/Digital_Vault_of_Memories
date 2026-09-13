@@ -1,0 +1,15 @@
+packages:
+  - apps/*
+  - packages/*
+  - tests/security
+
+# G0 build-script policy (execution prompt §8).
+#
+# pnpm 10 blocks dependency lifecycle scripts by default. That protection is
+# deliberately NOT disabled repository-wide. Packages are added here one at a
+# time, only when the package genuinely cannot install without its script, and
+# the reason is recorded in docs/release-evidence/G0-REPOSITORY-FOUNDATION.md.
+#
+# Current state: no dependency in the G0 foundation requires a build script,
+# so the allowlist is empty.
+onlyBuiltDependencies: []

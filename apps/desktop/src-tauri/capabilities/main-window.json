@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Least-privilege capability for the single G0 application window. The renderer is granted no plugin permission at all: it can invoke the application's own typed commands and nothing else. Blueprint v2 §20.2, INV-012, INV-013.",
+  "windows": ["main"],
+  "local": true,
+  "permissions": []
+}

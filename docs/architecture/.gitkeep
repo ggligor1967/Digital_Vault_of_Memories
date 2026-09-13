@@ -1,0 +1,7 @@
+# Reserved by the canonical repository topology of Blueprint v2 §7.
+#
+# Architecture and format specifications derived from Blueprint v2. Populated as each gate defines a binary or IPC format.
+#
+# This placeholder exists only so that a clean `git clone` reconstructs the
+# intended topology. Delete it in the same change that adds the first real
+# file here.

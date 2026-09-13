@@ -1,0 +1,44 @@
+{
+  "name": "digital-vault-of-memories",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Digital Vault of Memories — local-first encrypted personal memory vault (Blueprint v2). Gate G0: repository foundation.",
+  "license": "SEE LICENSE IN SECURITY.md",
+  "packageManager": "pnpm@10.27.0",
+  "engines": {
+    "node": ">=22.22.2 <23",
+    "pnpm": ">=10.27.0 <11"
+  },
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "typecheck": "pnpm -r --workspace-concurrency=1 run typecheck",
+    "test": "pnpm -r --workspace-concurrency=1 run test",
+    "build": "pnpm --filter @dvm/desktop run build",
+    "contracts:generate": "cargo run --locked --quiet --package dvm-domain --bin dvm-contracts-gen",
+    "contracts:check": "cargo test --locked --package dvm-domain --test contract_drift",
+    "rust:metadata": "cargo metadata --locked --format-version 1 --quiet",
+    "rust:fmt:check": "cargo fmt --all -- --check",
+    "rust:clippy": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
+    "rust:test": "cargo test --workspace --locked",
+    "security:check": "pnpm --filter @dvm/security-tests run test",
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "tauri:build:smoke": "tauri build --no-bundle",
+    "runtime:evidence": "node scripts/runtime-evidence.mjs",
+    "verify:g0": "node scripts/verify-g0.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@tauri-apps/cli": "2.11.4",
+    "eslint": "10.10.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.6",
+    "globals": "17.12.0",
+    "prettier": "3.9.6",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.0"
+  }
+}

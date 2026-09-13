@@ -1,0 +1,21 @@
+# Generated / vendored
+pnpm-lock.yaml
+Cargo.lock
+node_modules/
+dist/
+target/
+apps/desktop/src-tauri/gen/
+coverage/
+.dvm-local/
+
+# Normative source documents are byte-verified by SHA-256 (execution prompt §2)
+# and MUST NOT be reformatted.
+Digital_Vault_of_Memories_Blueprint_v2.md
+Digital_Vault_of_Memories_Blueprint_v2_Gates.yaml
+
+# Placeholders
+**/.gitkeep
+
+# Generated TypeScript contract (emitted by the Rust generator; formatting is
+# fixed by the generator so Prettier must not fight it).
+packages/contracts/src/generated/

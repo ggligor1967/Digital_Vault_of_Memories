@@ -1,0 +1,59 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Digital Vault of Memories",
+  "version": "0.1.0",
+  "identifier": "app.dvm.digital-vault-of-memories",
+  "build": {
+    "beforeDevCommand": "pnpm --filter @dvm/desktop run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "pnpm --filter @dvm/desktop run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Digital Vault of Memories",
+        "width": 900,
+        "height": 640,
+        "minWidth": 640,
+        "minHeight": 480,
+        "resizable": true,
+        "center": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "freezePrototype": true,
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' asset: data: blob:; font-src 'self'; media-src 'self' asset: blob:; connect-src 'self' ipc: http://ipc.localhost; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'",
+      "devCsp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data: blob:; font-src 'self' data:; media-src 'self' asset: blob:; connect-src 'self' ipc: http://ipc.localhost ws://localhost:5173 http://localhost:5173; worker-src 'self' blob:; manifest-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'",
+      "capabilities": ["main-window"],
+      "assetProtocol": {
+        "enable": false,
+        "scope": []
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Utility",
+    "shortDescription": "Local-first encrypted vault for personal digital memories.",
+    "longDescription": "Digital Vault of Memories imports, preserves, organises and searches personal digital memories entirely on the local machine. Gate G0 ships the repository foundation only: no vault, storage, search or AI functionality is present.",
+    "publisher": "Digital Vault of Memories",
+    "copyright": "Digital Vault of Memories contributors",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  }
+}

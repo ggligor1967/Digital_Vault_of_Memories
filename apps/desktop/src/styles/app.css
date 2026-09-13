@@ -1,0 +1,112 @@
+/*
+ * Minimal foundation styling.
+ *
+ * Gate G0 forbids a visual-polish project, so this file does only what the
+ * accessibility baseline of Blueprint v2 §28.1 requires: readable type, a
+ * colour scheme that follows the OS, and a visible focus ring.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --dvm-bg: #f7f7f8;
+  --dvm-surface: #ffffff;
+  --dvm-text: #16161a;
+  --dvm-muted: #55555f;
+  --dvm-border: #d8d8de;
+  --dvm-accent: #2f5fd0;
+  --dvm-danger: #a3121f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --dvm-bg: #131316;
+    --dvm-surface: #1c1c21;
+    --dvm-text: #f2f2f4;
+    --dvm-muted: #a6a6b0;
+    --dvm-border: #33333c;
+    --dvm-accent: #8fb0ff;
+    --dvm-danger: #ff8f9a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--dvm-bg);
+  color: var(--dvm-text);
+  font-family:
+    'Segoe UI',
+    system-ui,
+    -apple-system,
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+:focus-visible {
+  outline: 2px solid var(--dvm-accent);
+  outline-offset: 2px;
+}
+
+.app {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.panel {
+  width: 100%;
+  max-width: 440px;
+  padding: 24px;
+  border: 1px solid var(--dvm-border);
+  border-radius: 10px;
+  background: var(--dvm-surface);
+}
+
+.panel__title {
+  margin: 0 0 4px;
+  font-size: 19px;
+  font-weight: 600;
+}
+
+.panel__status {
+  margin: 0 0 20px;
+  color: var(--dvm-muted);
+}
+
+.panel__rows {
+  margin: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.panel__error {
+  margin: 20px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--dvm-border);
+  color: var(--dvm-danger);
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.status-row__label {
+  margin: 0;
+  color: var(--dvm-muted);
+}
+
+.status-row__value {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}

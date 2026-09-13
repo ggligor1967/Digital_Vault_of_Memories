@@ -1,0 +1,185 @@
+# Gate G0 — Repository Foundation
+#
+# This workflow deliberately does not re-implement the gate checks. It sets up
+# the pinned toolchain and then runs `scripts/verify-g0.mjs`, the same script a
+# contributor runs locally. Blueprint v2 §35 and gate G0 both require CI to
+# execute the same commands as local development, and the only way to keep that
+# true over time is to have one implementation.
+#
+# Windows is the first-class target because the MVP is Windows-first
+# (Blueprint v2 §35). Ubuntu runs as a portability signal and is allowed to
+# fail independently: no platform is advertised as supported until its
+# packaging and recovery gates pass.
+
+name: G0 — Repository Foundation
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g0-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Fail fast rather than waiting on a stalled network operation.
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+  RUST_BACKTRACE: 1
+
+jobs:
+  verify:
+    name: Verify G0 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            primary: true
+          - os: ubuntu-latest
+            primary: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # verify-g0.mjs asserts that the frozen install and locked resolution
+          # leave both lockfiles untouched, which needs real git history.
+          fetch-depth: 1
+
+      - name: Install Linux WebKit dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        # Version comes from the `packageManager` field; naming it here too
+        # would create a second place to keep in sync.
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-toolchain.toml pins the exact release and components; this
+          # action reads it when given the same channel.
+          toolchain: '1.94.1'
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      - name: Report toolchain versions
+        shell: bash
+        run: |
+          echo "node    $(node --version)"
+          echo "pnpm    $(pnpm --version)"
+          echo "rustc   $(rustc --version)"
+          echo "cargo   $(cargo --version)"
+          echo "rustfmt $(cargo fmt --version)"
+          echo "clippy  $(cargo clippy --version)"
+          echo "os      ${{ matrix.os }}"
+
+      - name: Verify pinned versions match the repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_node="$(tr -d '[:space:]' < .node-version)"
+          actual_node="$(node --version | sed 's/^v//')"
+          if [ "$expected_node" != "$actual_node" ]; then
+            echo "::error::Node $actual_node does not match the pinned $expected_node"
+            exit 1
+          fi
+          expected_rust="$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+          actual_rust="$(rustc --version | awk '{print $2}')"
+          if [ "$expected_rust" != "$actual_rust" ]; then
+            echo "::error::Rust $actual_rust does not match the pinned $expected_rust"
+            exit 1
+          fi
+          echo "Node and Rust match the pinned versions."
+
+      - name: Run the G0 gate
+        shell: bash
+        # `--no-runtime` because a GitHub runner has no interactive desktop
+        # session in which to open a window. The runtime IPC evidence is
+        # therefore captured locally and recorded in
+        # docs/release-evidence/G0-REPOSITORY-FOUNDATION.md; the script reports
+        # the step as SKIPPED rather than letting it look like it passed.
+        run: node scripts/verify-g0.mjs --no-runtime
+
+      - name: Upload the renderer bundle
+        if: matrix.primary && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renderer-bundle
+          path: apps/desktop/dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  evidence:
+    name: G0 evidence summary
+    runs-on: ubuntu-latest
+    needs: verify
+    if: always()
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Summarise
+        shell: bash
+        run: |
+          {
+            echo "# DVM-V2 / G0 — Repository Foundation"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Ref | \`${GITHUB_REF}\` |"
+            echo "| Verify job | ${{ needs.verify.result }} |"
+            echo
+            echo "## Steps executed"
+            echo
+            echo '```'
+            node scripts/verify-g0.mjs --list
+            echo '```'
+            echo
+            echo "## Not verified by CI"
+            echo
+            echo "- \`runtime\` — a hosted runner has no interactive desktop session."
+            echo "  Runtime IPC evidence is captured locally with \`pnpm runtime:evidence\`"
+            echo "  and recorded in \`docs/release-evidence/G0-REPOSITORY-FOUNDATION.md\`."
+            echo
+            echo "## Deferred to gate G6"
+            echo
+            echo "Dependency vulnerability scanning, licence scanning and SBOM generation are"
+            echo "assigned to G6 by \`Gates.yaml\` and are not G0 blockers."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if verification did not pass
+        if: needs.verify.result != 'success'
+        run: |
+          echo "::error::G0 verification did not pass"
+          exit 1

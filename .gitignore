@@ -1,0 +1,27 @@
+# --- JavaScript / pnpm ---
+node_modules/
+.pnpm-store/
+dist/
+*.tsbuildinfo
+
+# --- Rust / Cargo ---
+target/
+
+# --- Tauri generated ---
+apps/desktop/src-tauri/gen/
+
+# --- Tooling caches ---
+.eslintcache
+.vite/
+coverage/
+
+# --- Local machine artefacts (never committed; runtime evidence is transcribed
+#     into docs/release-evidence/ as text, the raw captures stay local) ---
+.dvm-local/
+
+# --- OS / editor ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+*.swp

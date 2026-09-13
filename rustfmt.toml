@@ -1,0 +1,4 @@
+edition = "2024"
+# The working tree is normalised to LF by .gitattributes; keep rustfmt aligned
+# so `cargo fmt --check` is reproducible on Windows checkouts.
+newline_style = "Unix"

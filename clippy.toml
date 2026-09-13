@@ -1,0 +1,14 @@
+# Clippy configuration for the Digital Vault of Memories workspace.
+#
+# `unwrap_used`, `expect_used` and `panic` are denied in the workspace lint
+# table because the trusted backend must never terminate the process on an
+# error path. Test code is different: a failed assumption in a test *should*
+# abort that test loudly, and forcing tests to thread `Result` through every
+# fixture would make them harder to read without making anything safer.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# Blueprint v2 §7.1 pins the toolchain; tell Clippy the same MSRV so it does
+# not suggest APIs newer than the pinned compiler.
+msrv = "1.94"

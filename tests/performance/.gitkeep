@@ -1,0 +1,7 @@
+# Reserved by the canonical repository topology of Blueprint v2 §7.
+#
+# Performance and large-corpus budgets (Blueprint v2 §27). Authorised from gate G1.
+#
+# This placeholder exists only so that a clean `git clone` reconstructs the
+# intended topology. Delete it in the same change that adds the first real
+# file here.

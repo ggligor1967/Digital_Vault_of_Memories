@@ -1,0 +1,268 @@
+blueprint:
+  name: Digital Vault of Memories
+  version: 2.0.0
+  status: design_baseline
+  production_ready: false
+  primary_target: windows_desktop
+  normative_document: Digital_Vault_of_Memories_Blueprint_v2.md
+
+invariants:
+  - id: INV-001
+    name: recoverable_original
+    statement: Successful import implies byte-for-byte recoverable original bytes.
+  - id: INV-002
+    name: hash_identity
+    statement: Every canonical blob records plaintext SHA-256 and size in the encrypted database.
+  - id: INV-003
+    name: no_orphan_success
+    statement: READY requires canonical blob existence and committed database references.
+  - id: INV-004
+    name: authenticated_corruption_detection
+    statement: Authentication failure is surfaced as corruption; partial plaintext is never accepted.
+  - id: INV-005
+    name: immutable_originals
+    statement: Processing never mutates canonical imported bytes.
+  - id: INV-006
+    name: durable_jobs
+    statement: Persisted jobs survive restart.
+  - id: INV-007
+    name: stable_job_payloads
+    statement: Jobs reference stable vault IDs, not ephemeral browser objects or handles.
+  - id: INV-008
+    name: ack_after_success
+    statement: Jobs become DONE only after durable result commit.
+  - id: INV-009
+    name: crash_recovery
+    statement: Expired leases become retryable without duplicate canonical effects.
+  - id: INV-010
+    name: idempotent_replay
+    statement: Replayed idempotent jobs do not duplicate canonical artifacts.
+  - id: INV-011
+    name: renderer_isolation
+    statement: Renderer never receives VMK, DB key, blob key root, or provider secrets.
+  - id: INV-012
+    name: no_generic_shell
+    statement: Renderer has no arbitrary shell execution capability.
+  - id: INV-013
+    name: no_generic_filesystem
+    statement: Renderer has no arbitrary host filesystem access.
+  - id: INV-014
+    name: explicit_remote_egress
+    statement: Every remote processing request is authorized against a visible egress scope.
+  - id: INV-015
+    name: locked_inaccessible
+    statement: Locked vault content is inaccessible through application IPC.
+  - id: INV-016
+    name: real_search_ids
+    statement: Search results reference existing deterministic item IDs.
+  - id: INV-017
+    name: compatible_embeddings
+    statement: Vector comparisons require compatible model identity, revision, and dimension.
+  - id: INV-018
+    name: derived_vector_index
+    statement: Vector index deletion never destroys canonical embeddings or originals.
+  - id: INV-019
+    name: ai_optional
+    statement: Core vault workflows work with all AI providers disabled.
+  - id: INV-020
+    name: ai_provenance
+    statement: Persisted AI output records provider/model/schema provenance.
+  - id: INV-021
+    name: verified_restore
+    statement: Backup is not declared restorable until verification passes.
+  - id: INV-022
+    name: schema_monotonicity
+    statement: Newer unsupported schemas cannot be mutated by older binaries.
+  - id: INV-023
+    name: migration_atomicity
+    statement: Failed migration leaves a documented pre- or post-migration state.
+  - id: INV-024
+    name: explicit_formats
+    statement: Blob and backup formats carry explicit versions and reject unknown mandatory versions.
+  - id: INV-025
+    name: release_evidence
+    statement: Production release requires evidence for all mandatory gates.
+
+gates:
+  - id: G0
+    name: REPOSITORY_FOUNDATION
+    mandatory: true
+    goal: Deterministic clean-clone foundation.
+    requires:
+      - tauri_2_boots
+      - vite_root_index_html
+      - pnpm_lock_committed
+      - cargo_lock_committed
+      - frozen_install_passes
+      - no_missing_dependencies
+      - lint_passes
+      - typecheck_passes
+      - cargo_fmt_passes
+      - cargo_clippy_passes
+      - unit_smoke_passes
+      - no_arbitrary_renderer_fs_or_shell
+      - ci_matches_local_commands
+    stop_on:
+      - clean_install_failure
+      - clean_build_failure
+
+  - id: G1
+    name: ZERO_LOSS_VAULT_STORAGE
+    mandatory: true
+    depends_on: [G0]
+    goal: Preserve original bytes durably.
+    requires:
+      - encrypted_native_sqlite_reopen
+      - versioned_vault_header
+      - streaming_sha256
+      - dvb1_streaming_encryption
+      - atomic_blob_activation
+      - transactional_item_blob_link
+      - deduplication
+      - durable_jobs
+      - startup_reconciliation
+      - multi_gb_bounded_memory_test
+      - crash_injection_import_suite
+    stop_on:
+      - success_without_recoverable_original
+
+  - id: G2
+    name: SECURITY_AND_KEY_LIFECYCLE
+    mandatory: true
+    depends_on: [G1]
+    goal: Defensible security and secret boundary.
+    requires:
+      - threat_model
+      - argon2id_passphrase_slot
+      - recovery_key_slot
+      - optional_os_quick_unlock_slot
+      - vmk_subkey_hierarchy
+      - secret_isolation_tests
+      - tauri_least_privilege
+      - production_csp
+      - os_credential_provider_secrets
+      - log_redaction_tests
+    stop_on:
+      - renderer_receives_root_secret
+      - arbitrary_renderer_shell
+      - arbitrary_renderer_filesystem
+
+  - id: G3
+    name: RECOVERY_BACKUP_MIGRATION
+    mandatory: true
+    depends_on: [G2]
+    goal: Prove recoverability and safe evolution.
+    requires:
+      - dvbk1_writer
+      - consistent_db_snapshot
+      - authenticated_manifest
+      - structural_verification
+      - full_verification
+      - safe_restore_staging
+      - migration_checksums
+      - future_schema_refusal
+      - destructive_restore_test
+    stop_on:
+      - restored_plaintext_hash_mismatch
+
+  - id: G4
+    name: DETERMINISTIC_SEARCH
+    mandatory: true
+    depends_on: [G3]
+    goal: Real lexical and semantic retrieval.
+    requires:
+      - sqlite_fts5
+      - fts_sync_tests
+      - embedding_compatibility_metadata
+      - actual_vector_index
+      - vector_rebuild
+      - hybrid_rank_fusion
+      - no_hallucinated_ids
+      - offline_search
+    stop_on:
+      - semantic_search_without_stored_vectors
+
+  - id: G5
+    name: AI_PROVIDER_LAYER
+    mandatory_for_ai: true
+    depends_on: [G4]
+    goal: Optional replaceable privacy-scoped AI.
+    requires:
+      - capability_provider_contract
+      - local_provider_adapter
+      - provider_model_validation
+      - backend_egress_policy
+      - explicit_remote_consent
+      - structured_output_validation
+      - ai_provenance
+      - graceful_provider_failure
+    stop_on:
+      - remote_call_without_egress_authorization
+
+  - id: G6
+    name: PRODUCT_HARDENING_RELEASE_CANDIDATE
+    mandatory: true
+    depends_on: [G5]
+    goal: Operational and release readiness.
+    requires:
+      - media_resource_limits
+      - accessibility_pass
+      - large_corpus_report
+      - redacted_support_bundle
+      - signed_build_update_path
+      - dependency_scans
+      - license_scan
+      - sbom
+      - clean_windows_installer_test
+      - release_evidence_pack
+    stop_on:
+      - open_p0
+      - unresolved_data_loss_security_recovery_p1
+
+  - id: G7
+    name: MOBILE
+    mandatory: false
+    post_mvp: true
+    depends_on: [G6]
+
+  - id: G8
+    name: PLUGINS
+    mandatory: false
+    post_mvp: true
+    depends_on: [G6]
+
+  - id: G9
+    name: SYNC_COLLABORATION
+    mandatory: false
+    post_mvp: true
+    depends_on: [G6]
+
+release_definition_of_done:
+  - clean_frozen_install
+  - lint_typecheck_fmt_clippy
+  - production_build
+  - vault_create_lock_unlock_reopen
+  - byte_exact_original_recovery
+  - bounded_memory_large_file_import
+  - documented_dedup_behavior
+  - crash_reconciliation
+  - durable_queue_restart
+  - ciphertext_corruption_rejected
+  - wrong_passphrase_no_mutation
+  - renderer_secret_isolation
+  - no_arbitrary_renderer_shell_or_fs
+  - fts_expected_results
+  - vector_expected_neighbors
+  - hybrid_expected_results
+  - core_works_without_ai
+  - local_only_blocks_remote_network
+  - backup_full_verification
+  - destructive_restore_hash_equality
+  - old_schema_upgrade_and_future_schema_refusal
+  - offline_core_workflow
+  - accessibility_checks
+  - no_unaccepted_critical_high_security_findings
+  - clean_windows_installer_test
+  - release_sbom_and_sha256
+
+next_authorized_unit: G0_REPOSITORY_FOUNDATION

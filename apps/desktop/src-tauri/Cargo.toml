@@ -1,0 +1,36 @@
+[package]
+name = "dvm-desktop"
+description = "Tauri 2 desktop shell for Digital Vault of Memories: the trusted native boundary and composition root."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+# The shell lives in a library so its wiring can be unit tested without
+# starting an event loop.
+#
+# Tauri's scaffolding also emits `staticlib` and `cdylib` here, which exist
+# solely so the same crate can be linked into an Android or iOS host. Mobile is
+# Blueprint v2 §32 / gate G7 and an explicit non-goal for G0, so those two
+# crate types are omitted: they would roughly triple the build artefacts and
+# link time for a target this gate does not build. G7 adds them back.
+name = "dvm_desktop_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+dvm-application = { workspace = true }
+dvm-domain = { workspace = true }
+dvm-observability = { workspace = true }
+tauri = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
