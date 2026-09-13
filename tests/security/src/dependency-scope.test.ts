@@ -2,9 +2,8 @@
  * Scope assertions: the foundation must not have quietly acquired a
  * later-gate dependency.
  *
- * Gate G0 is a *bounded* transaction. The cheapest way to violate it is not to
- * write a feature but to add the library for one — a SQLCipher binding, an
- * embedding index, an AI SDK — and let the implementation follow later. These
+ * G1 permits its explicitly selected native storage and crypto dependencies.
+ * Other storage stacks and future-gate dependencies remain rejected. These
  * tests read every manifest in the repository and fail if such a dependency
  * appears without the corresponding gate having been opened.
  */
@@ -21,10 +20,7 @@ import { readRepoFile, readRepoJson, walkFiles } from './repository.ts';
  * reviewable decision rather than an unnoticed `pnpm add`.
  */
 const LATER_GATE_DEPENDENCIES: { fragment: string; gate: string }[] = [
-  // G1 — storage
-  { fragment: 'sqlcipher', gate: 'G1' },
-  { fragment: 'rusqlite', gate: 'G1' },
-  { fragment: 'libsqlite3', gate: 'G1' },
+  // Unselected storage stacks remain forbidden even though G1 is current.
   { fragment: 'sqlx', gate: 'G1' },
   { fragment: 'diesel', gate: 'G1' },
   { fragment: 'sql.js', gate: 'G1' },
@@ -32,7 +28,6 @@ const LATER_GATE_DEPENDENCIES: { fragment: string; gate: string }[] = [
   { fragment: 'tauri-plugin-sql', gate: 'G1' },
   // G2 — cryptography and secret storage
   { fragment: 'argon2', gate: 'G2' },
-  { fragment: 'chacha20', gate: 'G2' },
   { fragment: 'aes-gcm', gate: 'G2' },
   { fragment: 'ring', gate: 'G2' },
   { fragment: 'keyring', gate: 'G2' },
@@ -58,6 +53,11 @@ const LATER_GATE_DEPENDENCIES: { fragment: string; gate: string }[] = [
   { fragment: 'ffmpeg', gate: 'G6' },
   { fragment: 'image-rs', gate: 'G6' },
   { fragment: 'sharp', gate: 'G6' },
+  // G8 — plugin runtimes
+  { fragment: 'extism', gate: 'G8' },
+  { fragment: 'wasmtime', gate: 'G8' },
+  { fragment: 'wasmer', gate: 'G8' },
+  { fragment: 'rhai', gate: 'G8' },
 ];
 
 /**
@@ -151,7 +151,7 @@ describe('dependency scope', () => {
     for (const { manifest, name } of allDependencies) {
       for (const { fragment, gate } of LATER_GATE_DEPENDENCIES) {
         if (matchesFragment(name, fragment)) {
-          violations.push(`${manifest}: "${name}" is ${gate} scope, but G0 is the current gate`);
+          violations.push(`${manifest}: "${name}" is ${gate} scope, but G1 is the current gate`);
         }
       }
     }
@@ -188,7 +188,7 @@ describe('dependency scope', () => {
 });
 
 describe('reserved crates', () => {
-  const RESERVED = ['dvm-crypto', 'dvm-storage', 'dvm-search', 'dvm-ai', 'dvm-media', 'dvm-backup'];
+  const RESERVED = ['dvm-search', 'dvm-ai', 'dvm-media', 'dvm-backup'];
 
   it('declare no third-party dependency yet', () => {
     for (const crate of RESERVED) {
@@ -214,5 +214,59 @@ describe('reserved crates', () => {
         `${crate} must not define functions before its gate opens`,
       ).toEqual([]);
     }
+  });
+});
+
+describe('G1 storage boundary', () => {
+  it('keeps future-gate detection active for representative prohibited dependencies', () => {
+    for (const name of [
+      'argon2',
+      'keyring',
+      'hnsw',
+      'tantivy',
+      'openai',
+      'ffmpeg',
+      'zip',
+      'tar',
+      'extism',
+      'wasmtime',
+      'wasmer',
+      'rhai',
+    ]) {
+      expect(LATER_GATE_DEPENDENCIES.some(({ fragment }) => matchesFragment(name, fragment))).toBe(
+        true,
+      );
+    }
+  });
+
+  it('compiles crash injection only into the Rust test module', () => {
+    const lib = readRepoFile('crates/dvm-storage/src/lib.rs');
+    expect(lib).toMatch(/#\[cfg\(test\)\]\s*mod tests;/);
+    for (const path of walkFiles('crates/dvm-storage/src').filter(
+      (p) => p.endsWith('.rs') && !p.endsWith('/tests.rs'),
+    )) {
+      const source = readRepoFile(path);
+      expect(source).not.toContain('std::env::var');
+      expect(source).not.toContain('std::process::exit');
+      const calls = source.match(/#\[cfg\(test\)\]\s*crate::tests::checkpoint/g) ?? [];
+      expect(calls.length).toBe((source.match(/crate::tests::checkpoint/g) ?? []).length);
+    }
+  });
+
+  it('keeps G1 out of renderer commands and preserves future workspace placeholders', () => {
+    const commands = readRepoFile('apps/desktop/src-tauri/src/lib.rs');
+    expect(commands).not.toMatch(/vault_create|vault_unlock|import_paths/);
+    for (const path of walkFiles('apps/desktop/src').filter(
+      (p) => p.endsWith('.ts') || p.endsWith('.tsx'),
+    )) {
+      expect(readRepoFile(path)).not.toMatch(/VaultMasterKey|BlobRootKey|DbKey/);
+    }
+  });
+
+  it('places C6 immediately after canonical rename, before the post-rename sync', () => {
+    const source = readRepoFile('crates/dvm-storage/src/vault.rs');
+    expect(source).toMatch(
+      /fs::rename\(&staged\.staging_path, &canonical\)[^\n]*\n\s*#\[cfg\(test\)\]\s*crate::tests::checkpoint\("C6"\);\s*OpenOptions::new\(\)/,
+    );
   });
 });

@@ -119,6 +119,13 @@ jobs:
           fi
           echo "Node and Rust match the pinned versions."
 
+      - name: Native Perl for G1 bundled OpenSSL foundation regression
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path C:\Strawberry\perl\bin\perl.exe)) { throw 'Native Strawberry Perl is required' }
+          'C:\Strawberry\perl\bin' >> $env:GITHUB_PATH
+
       - name: Run the G0 gate
         shell: bash
         # `--no-runtime` because a GitHub runner has no interactive desktop

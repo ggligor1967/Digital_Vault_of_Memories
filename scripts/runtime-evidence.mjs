@@ -15,12 +15,18 @@
  * was not, and G0 cannot be reported as PASS.
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
-const EVIDENCE_DIR = join(REPO_ROOT, '.dvm-local', 'g0-runtime-evidence');
+const isG1Regression = process.env.DVM_VERIFICATION_GATE === 'G1';
+const EVIDENCE_DIR = join(
+  REPO_ROOT,
+  '.dvm-local',
+  isG1Regression ? `g1-runtime-${randomUUID()}` : 'g0-runtime-evidence',
+);
 const DIAGNOSTICS_FILE = join(EVIDENCE_DIR, 'diagnostics.jsonl');
 const PROCESS_LOG = join(EVIDENCE_DIR, 'tauri-dev.log');
 const SUMMARY_FILE = join(EVIDENCE_DIR, 'summary.json');
@@ -180,7 +186,7 @@ function fail(message, details) {
 }
 
 async function main() {
-  rmSync(EVIDENCE_DIR, { recursive: true, force: true });
+  if (!isG1Regression) rmSync(EVIDENCE_DIR, { recursive: true, force: true });
   mkdirSync(EVIDENCE_DIR, { recursive: true });
 
   console.log('Runtime evidence for DVM-V2 / G0');

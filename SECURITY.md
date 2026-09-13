@@ -2,21 +2,26 @@
 
 ## Current state — read this first
 
-Digital Vault of Memories is at **gate G0: repository foundation**. It stores nothing, encrypts nothing and protects nothing, because it does not yet accept any data.
+Digital Vault of Memories has closed G0 and is implementing **G1: zero-loss vault storage** through trusted Rust APIs and test-key injection. The renderer still exposes only foundation status.
 
-Do not use it to hold anything you care about. The cryptographic architecture specified in Blueprint v2 §9 — Argon2id keyslots, a random Vault Master Key, HKDF-derived subkeys, XChaCha20-Poly1305 blob framing — is **designed and not implemented**. It is authorised from gate G2. Until the gate evidence in `docs/release-evidence/` says otherwise, treat every security property below as a property of the _repository_, not of a product.
+G1 implements encrypted storage primitives: SQLCipher, a random VMK type,
+HKDF-separated storage keys and authenticated DVB1 streaming. Acceptance status
+is recorded in G1 evidence; implementation alone is not verification. G2
+passphrase, recovery and device-key lifecycle is NOT implemented. There is no
+production vault creation/unlock UX and no persisted raw key. Do not use an
+injected-key test vault for irreplaceable data.
 
 ## What G0 does establish
 
 The boundary. Blueprint v2 makes five invariants about where authority lives, and all five are decided by the structure of the code rather than by later feature work:
 
-| Invariant | Statement                                                  | How G0 holds it                                                                                   |
-| --------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| INV-011   | The renderer never receives vault keys or provider secrets | No secret exists yet, and the only IPC payload is three version strings and a health discriminant |
-| INV-012   | The renderer has no arbitrary shell execution              | The window's capability grants no plugin permissions; no shell plugin is a dependency             |
-| INV-013   | The renderer has no arbitrary host filesystem access       | As above; no filesystem plugin is a dependency, and the renderer may not import `node:*`          |
-| INV-014   | Remote egress is explicit and scoped                       | No network dependency exists; the production CSP permits no remote origin                         |
-| INV-015   | Locked vault content is unreachable through IPC            | No vault exists; the command surface is a single read-only status call                            |
+| Invariant | Statement                                                  | How G0 holds it                                                                          |
+| --------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| INV-011   | The renderer never receives vault keys or provider secrets | G1 keys stay in Rust; IPC still carries only foundation versions and health              |
+| INV-012   | The renderer has no arbitrary shell execution              | The window's capability grants no plugin permissions; no shell plugin is a dependency    |
+| INV-013   | The renderer has no arbitrary host filesystem access       | As above; no filesystem plugin is a dependency, and the renderer may not import `node:*` |
+| INV-014   | Remote egress is explicit and scoped                       | No network dependency exists; the production CSP permits no remote origin                |
+| INV-015   | Locked vault content is unreachable through IPC            | G1 storage has no IPC surface; the command surface remains foundation status             |
 
 These are enforced mechanically, not by review:
 
@@ -58,7 +63,7 @@ frame-ancestors 'none'; form-action 'none'
 
 `http://ipc.localhost` is Tauri's loopback IPC origin on Windows, not a network destination. Every asset is bundled locally, so no CDN or font host appears anywhere.
 
-Development (`app.security.devCsp`) differs in exactly four ways, each recorded with its reason in `tests/security/src/csp.test.ts` and enforced by a test that fails on any fifth:
+Development (`app.security.devCsp`) has the following five source additions across four directives, each recorded in `tests/security/src/csp.test.ts`; unrecorded additions fail the test:
 
 | Directive     | Development addition    | Why                                                                                                                                                                      |
 | ------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -78,7 +83,7 @@ Failures cross the IPC boundary as the canonical envelope of Blueprint v2 §23.1
 AppError { code, message_key, retryable, correlation_id, safe_details? }
 ```
 
-There is deliberately no field that can carry a stack trace, a source-error chain, an absolute path or a secret. `message_key` is a localisation key rather than prose, so the backend never embeds interpolated internal data in a user-visible string. `safe_details` passes through an allow-list filter that keeps only ASCII letters, digits and a small punctuation set, which destroys paths, URLs, connection strings and quoted credentials as a class. Anything the backend needs to keep for diagnosis stays local and is correlated through `correlation_id`.
+There is deliberately no field that can carry a stack trace, a source-error chain, an absolute path or a secret. `message_key` is a localisation key rather than prose, so the backend never embeds interpolated internal data in a user-visible string. `safe_details` passes through an allow-list filter that keeps only ASCII letters, digits and a small punctuation set, which removes structural separators but does not redact private words. G1 errors therefore use code-only constructors and never populate details from source paths, filenames or keys. Anything the backend needs to keep for diagnosis stays local and is correlated through `correlation_id`.
 
 The renderer normalises any rejection that is _not_ a well-formed envelope — a transport failure, an unregistered command, an unparseable payload — to `INTERNAL` and carries no detail across, because it has no way to know that detail is safe.
 
@@ -103,3 +108,21 @@ When the project reaches gate G6 this section is replaced by a real disclosure p
 ## Licence
 
 No licence has been chosen. Until one is, the work is under exclusive copyright of its contributors and grants no redistribution rights. Choosing a licence is a prerequisite for the first release, not for G0.
+
+## G1 data handling
+
+Original names and source hints are written solely to encrypted metadata. Blob
+and staging names are random identifiers. The typed storage_failure diagnostic
+emits only an error code, ignoring even safe_details. G0's character sanitizer
+is not treated as a content-redaction mechanism. Private-path regression tests
+exercise the real failing import path and serialized diagnostic output.
+
+DVB1 consumers receive provisional chunks through a transactional sink. Whole
+original success requires authenticated header/frames, declared length, EOF and
+stored hash equality. Failed reads abort provisional output. No normal import
+creates a plaintext staging copy. Originals are never rewritten by jobs.
+
+Process-crash tests exist only in cfg(test); no release environment variable
+triggers process termination. Reconciliation quarantines ambiguous data rather
+than deleting it. Corrupt/missing originals prevent normal writes and mark items
+CORRUPTED. These are process-restart tests, not hardware power-failure certification.

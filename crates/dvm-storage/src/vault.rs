@@ -1,0 +1,483 @@
+//! Vault-owned encrypted staging, immutable canonicalization and startup recovery.
+use crate::database::{self, CipherEvidence, db_error};
+use dvm_crypto::{
+    BlobRootKey, DigestReceipt, PlaintextSink, VaultMasterKey, decrypt, encrypt, random_id,
+};
+use dvm_domain::{
+    AppError, ErrorCode,
+    storage::{
+        ImportReceipt, ImportRepository, ReconciliationHealth, ReconciliationReport, StagedImport,
+    },
+};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
+};
+use uuid::Uuid;
+
+/// Exclusive trusted vault owner. Share it through `Arc` for concurrent imports.
+/// The OS lock blocks competing processes and concurrent startup reconciliation.
+pub struct Vault {
+    pub(crate) root: PathBuf,
+    pub(crate) database: Mutex<Connection>,
+    pub(crate) blob_root: BlobRootKey,
+    _ownership: File,
+    /// Safe native cipher initialization evidence.
+    pub cipher: CipherEvidence,
+    /// Reconciliation performed before this instance admits writes.
+    pub reconciliation: ReconciliationReport,
+}
+
+pub(crate) fn io_error(error: &std::io::Error) -> AppError {
+    AppError::new(if error.kind() == std::io::ErrorKind::StorageFull {
+        ErrorCode::DiskFull
+    } else {
+        ErrorCode::Internal
+    })
+}
+pub(crate) fn uuid_bytes(id: &str) -> Result<[u8; 16], AppError> {
+    let parsed = Uuid::parse_str(id).map_err(|_| AppError::new(ErrorCode::CorruptDatabase))?;
+    if parsed.to_string() != id {
+        return Err(AppError::new(ErrorCode::CorruptDatabase));
+    }
+    Ok(*parsed.as_bytes())
+}
+pub(crate) fn blob_relative(id: &str) -> Result<PathBuf, AppError> {
+    uuid_bytes(id)?;
+    Ok(PathBuf::from("blobs").join(format!("{id}.dvb")))
+}
+
+/// A verification-only sink. Plaintext never escapes or becomes a filesystem copy.
+pub(crate) struct VerifyOnly;
+impl PlaintextSink for VerifyOnly {
+    fn stage(&mut self, _: &[u8]) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn commit(&mut self, _: &DigestReceipt) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn abort(&mut self) {}
+}
+
+impl Vault {
+    /// Creates only a trusted injected-key integration vault with no usable keyslot.
+    /// No production UI/IPC calls this API. G2 must supply durable wrapped keys.
+    /// # Errors
+    /// Refuses any existing root; any failed bootstrap must be preserved for diagnosis.
+    pub fn create_with_injected_key(root: &Path, key: &VaultMasterKey) -> Result<Self, AppError> {
+        fs::create_dir(root).map_err(|error| io_error(&error))?;
+        for directory in [
+            "blobs",
+            "indexes/vector",
+            "tmp",
+            "quarantine",
+            "local-state",
+        ] {
+            fs::create_dir_all(root.join(directory)).map_err(|error| io_error(&error))?;
+        }
+        let ownership = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root.join("local-state/owner.lock"))
+            .map_err(|error| io_error(&error))?;
+        ownership
+            .try_lock()
+            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        let mut header = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.join("vault.header"))
+            .map_err(|error| io_error(&error))?;
+        header
+            .write_all(&crate::header::serialize(
+                &crate::header::injected_key_header(),
+            )?)
+            .map_err(|error| io_error(&error))?;
+        header.sync_all().map_err(|error| io_error(&error))?;
+        drop(header);
+        let (db_key, blob_root) = key.storage_keys()?;
+        let (db, cipher) = database::open(&root.join("metadata.db"), &db_key, true)?;
+        let root = fs::canonicalize(root).map_err(|error| io_error(&error))?;
+        Ok(Self {
+            root,
+            database: Mutex::new(db),
+            blob_root,
+            _ownership: ownership,
+            cipher,
+            reconciliation: healthy_report(),
+        })
+    }
+
+    /// Opens an existing injected-key vault and reconciles before admitting writes.
+    /// # Errors
+    /// Wrong key, unknown header/schema/reader and database corruption fail closed.
+    pub fn open_with_injected_key(
+        root: &Path,
+        key: &VaultMasterKey,
+        now: u64,
+    ) -> Result<Self, AppError> {
+        let root = fs::canonicalize(root).map_err(|error| io_error(&error))?;
+        for name in [
+            "vault.header",
+            "metadata.db",
+            "blobs",
+            "tmp",
+            "quarantine",
+            "local-state",
+        ] {
+            if fs::symlink_metadata(root.join(name))
+                .map_err(|error| io_error(&error))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(AppError::new(ErrorCode::CorruptHeader));
+            }
+        }
+        let header_file =
+            File::open(root.join("vault.header")).map_err(|error| io_error(&error))?;
+        let mut bytes = Vec::new();
+        header_file
+            .take(16_385)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error(&error))?;
+        crate::header::parse(&bytes)?;
+        let ownership = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("local-state/owner.lock"))
+            .map_err(|error| io_error(&error))?;
+        ownership
+            .try_lock()
+            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        let (db_key, blob_root) = key.storage_keys()?;
+        let (db, cipher) = database::open(&root.join("metadata.db"), &db_key, false)?;
+        let mut vault = Self {
+            root,
+            database: Mutex::new(db),
+            blob_root,
+            _ownership: ownership,
+            cipher,
+            reconciliation: healthy_report(),
+        };
+        vault.reconciliation = vault.reconcile(now)?;
+        Ok(vault)
+    }
+
+    pub(crate) fn db(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
+        self.database
+            .lock()
+            .map_err(|_| AppError::new(ErrorCode::Internal))
+    }
+
+    pub(crate) fn require_writable(&self) -> Result<(), AppError> {
+        if self.reconciliation.health != ReconciliationHealth::Healthy {
+            return Err(AppError::new(ErrorCode::MissingBlob));
+        }
+        Ok(())
+    }
+
+    /// Recovers an original through a transactional sink, bound to the encrypted DB identity.
+    /// # Errors
+    /// Missing/corrupt originals mark affected items CORRUPTED and never return success.
+    pub fn recover(
+        &self,
+        id: &str,
+        sink: &mut impl PlaintextSink,
+    ) -> Result<DigestReceipt, AppError> {
+        let db = self.db()?;
+        let result = self.recover_locked(&db, id, sink);
+        if let Err(error) = &result {
+            sink.abort();
+            if matches!(
+                error.code,
+                ErrorCode::MissingBlob | ErrorCode::BlobAuthFailed
+            ) {
+                db.execute("UPDATE items SET status='CORRUPTED' WHERE id IN (SELECT item_id FROM item_blobs WHERE blob_id=?1)", [id]).map_err(|error| db_error(&error))?;
+            }
+        }
+        result
+    }
+
+    pub(crate) fn recover_locked(
+        &self,
+        db: &Connection,
+        id: &str,
+        sink: &mut impl PlaintextSink,
+    ) -> Result<DigestReceipt, AppError> {
+        let (hash, size, relative, version): (String, i64, String, u32) = db.query_row(
+            "SELECT sha256_hex,size_bytes,storage_relpath,crypto_format_version FROM blobs WHERE id=?1", [id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|error| db_error(&error))?;
+        let expected_path = blob_relative(id)?;
+        if Path::new(&relative) != expected_path || version != 1 {
+            return Err(AppError::new(ErrorCode::UnsupportedVaultVersion));
+        }
+        let path = self.root.join(expected_path);
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|_| AppError::new(ErrorCode::MissingBlob))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(AppError::new(ErrorCode::BlobAuthFailed));
+        }
+        let mut file = File::open(path).map_err(|_| AppError::new(ErrorCode::MissingBlob))?;
+        let id = uuid_bytes(id)?;
+        decrypt(
+            &mut file,
+            &self.blob_root.for_blob(&id)?,
+            &id,
+            Some(&DigestReceipt {
+                sha256_hex: hash,
+                size_bytes: u64::try_from(size)
+                    .map_err(|_| AppError::new(ErrorCode::CorruptDatabase))?,
+            }),
+            sink,
+        )
+    }
+
+    fn reconcile(&self, now: u64) -> Result<ReconciliationReport, AppError> {
+        let mut report = healthy_report();
+        let db = self.db()?;
+        // Reject unsupported mandatory reader metadata before any repair mutation.
+        let unsupported: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE crypto_format_version!=1)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|error| db_error(&error))?;
+        if unsupported {
+            return Err(AppError::new(ErrorCode::UnsupportedVaultVersion));
+        }
+        let mut statement = db
+            .prepare("SELECT id FROM blobs")
+            .map_err(|error| db_error(&error))?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| db_error(&error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| db_error(&error))?;
+        for id in &ids {
+            match self.recover_locked(&db, id, &mut VerifyOnly) {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ErrorCode::MissingBlob | ErrorCode::BlobAuthFailed
+                    ) =>
+                {
+                    db.execute("UPDATE items SET status='CORRUPTED' WHERE id IN (SELECT item_id FROM item_blobs WHERE blob_id=?1)", [id]).map_err(|error| db_error(&error))?;
+                    if error.code == ErrorCode::MissingBlob {
+                        report.missing_blobs += 1;
+                    }
+                    report.health = ReconciliationHealth::RepairRequired;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        for entry in fs::read_dir(self.root.join("blobs")).map_err(|error| io_error(&error))? {
+            let entry = entry.map_err(|error| io_error(&error))?;
+            let name = entry.file_name();
+            let referenced = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".dvb"))
+                .is_some_and(|id| ids.iter().any(|known| known == id));
+            if !referenced {
+                self.quarantine(&entry.path())?;
+                report.quarantined_orphans += 1;
+                report.health = ReconciliationHealth::RepairRequired;
+            }
+        }
+        // Exclusive ownership proves no live importer can own these candidates.
+        // Preserve even complete/ambiguous staging; never silently delete it.
+        for entry in fs::read_dir(self.root.join("tmp")).map_err(|error| io_error(&error))? {
+            let entry = entry.map_err(|error| io_error(&error))?;
+            self.quarantine(&entry.path())?;
+            report.quarantined_staging += 1;
+        }
+        report.expired_leases = db.execute(
+            "UPDATE jobs SET status=CASE WHEN attempts>=max_attempts THEN 'FAILED_TERMINAL' ELSE 'PENDING' END, leased_by=NULL, lease_until=NULL, available_at=?1, updated_at=?1 WHERE status='PROCESSING' AND lease_until<=?1", [crate::jobs::timestamp(now)?]).map_err(|error| db_error(&error))?;
+        Ok(report)
+    }
+
+    fn quarantine(&self, source: &Path) -> Result<(), AppError> {
+        let destination = self
+            .root
+            .join("quarantine")
+            .join(Uuid::new_v4().to_string());
+        if destination.exists() {
+            return Err(AppError::new(ErrorCode::Internal));
+        }
+        fs::rename(source, destination).map_err(|error| io_error(&error))
+    }
+}
+
+fn healthy_report() -> ReconciliationReport {
+    ReconciliationReport {
+        health: ReconciliationHealth::Healthy,
+        quarantined_staging: 0,
+        quarantined_orphans: 0,
+        missing_blobs: 0,
+        expired_leases: 0,
+    }
+}
+
+impl ImportRepository for Vault {
+    fn stage_import(&self, source: &Path) -> Result<StagedImport, AppError> {
+        self.require_writable()?;
+        let source_meta =
+            fs::symlink_metadata(source).map_err(|_| AppError::new(ErrorCode::SourceUnreadable))?;
+        if !source_meta.is_file() || source_meta.file_type().is_symlink() {
+            return Err(AppError::new(ErrorCode::SourceUnreadable));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(1); // Deny source mutation/deletion while preserving bytes.
+        }
+        let mut source_file = options
+            .open(source)
+            .map_err(|_| AppError::new(ErrorCode::SourceUnreadable))?;
+        let size = source_file
+            .metadata()
+            .map_err(|_| AppError::new(ErrorCode::SourceUnreadable))?
+            .len();
+        if size > i64::MAX as u64 {
+            return Err(AppError::new(ErrorCode::SourceUnreadable));
+        }
+        let blob_id = random_id()?;
+        let staging_path = self
+            .root
+            .join("tmp")
+            .join(format!("{}.part", Uuid::from_bytes(blob_id)));
+        #[cfg(test)]
+        crate::tests::checkpoint("C1");
+        let mut candidate = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+            .map_err(|error| io_error(&error))?;
+        #[cfg(test)]
+        crate::tests::checkpoint("C2");
+        #[cfg(test)]
+        let writer = crate::tests::ChunkCheckpointWriter::new(&mut candidate);
+        #[cfg(not(test))]
+        let writer = &mut candidate;
+        let identity = encrypt(
+            &mut source_file,
+            &mut { writer },
+            &self.blob_root.for_blob(&blob_id)?,
+            &blob_id,
+            size,
+        )?;
+        #[cfg(test)]
+        crate::tests::checkpoint("C4");
+        candidate.flush().map_err(|error| io_error(&error))?;
+        candidate.sync_all().map_err(|error| io_error(&error))?;
+        drop(candidate);
+        #[cfg(test)]
+        crate::tests::checkpoint("C5");
+        decrypt(
+            &mut File::open(&staging_path).map_err(|error| io_error(&error))?,
+            &self.blob_root.for_blob(&blob_id)?,
+            &blob_id,
+            Some(&identity),
+            &mut VerifyOnly,
+        )?;
+        Ok(StagedImport {
+            blob_id,
+            staging_path,
+            sha256_hex: identity.sha256_hex,
+            size_bytes: size,
+            source_name: source
+                .file_name()
+                .ok_or_else(|| AppError::new(ErrorCode::SourceUnreadable))?
+                .to_string_lossy()
+                .into_owned(),
+            source_path_hint: source.to_string_lossy().into_owned(),
+        })
+    }
+
+    fn commit_import(&self, staged: StagedImport) -> Result<ImportReceipt, AppError> {
+        self.require_writable()?;
+        let mut db = self.db()?;
+        let candidate_id = Uuid::from_bytes(staged.blob_id).to_string();
+        if staged.staging_path != self.root.join("tmp").join(format!("{candidate_id}.part")) {
+            return Err(AppError::new(ErrorCode::Internal));
+        }
+        let identity = DigestReceipt {
+            sha256_hex: staged.sha256_hex.clone(),
+            size_bytes: staged.size_bytes,
+        };
+        decrypt(
+            &mut File::open(&staged.staging_path).map_err(|error| io_error(&error))?,
+            &self.blob_root.for_blob(&staged.blob_id)?,
+            &staged.blob_id,
+            Some(&identity),
+            &mut VerifyOnly,
+        )?;
+        let existing: Option<(String, i64)> = db
+            .query_row(
+                "SELECT id,size_bytes FROM blobs WHERE sha256_hex=?1",
+                [&staged.sha256_hex],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| db_error(&error))?;
+        let (blob_id, new_blob) = if let Some((id, size)) = existing {
+            if u64::try_from(size).ok() != Some(staged.size_bytes) {
+                return Err(AppError::new(ErrorCode::CorruptDatabase));
+            }
+            self.recover_locked(&db, &id, &mut VerifyOnly)?;
+            fs::remove_file(&staged.staging_path).map_err(|error| io_error(&error))?;
+            (id, false)
+        } else {
+            let canonical = self.root.join(blob_relative(&candidate_id)?);
+            if canonical.exists() {
+                return Err(AppError::new(ErrorCode::Internal));
+            }
+            fs::rename(&staged.staging_path, &canonical).map_err(|error| io_error(&error))?;
+            #[cfg(test)]
+            crate::tests::checkpoint("C6");
+            OpenOptions::new()
+                .write(true)
+                .open(&canonical)
+                .map_err(|error| io_error(&error))?
+                .sync_all()
+                .map_err(|error| io_error(&error))?;
+            #[cfg(unix)]
+            File::open(self.root.join("blobs"))
+                .map_err(|error| io_error(&error))?
+                .sync_all()
+                .map_err(|error| io_error(&error))?;
+            (candidate_id, true)
+        };
+        let tx = db.transaction().map_err(|error| db_error(&error))?;
+        if new_blob {
+            tx.execute("INSERT INTO blobs(id,sha256_hex,size_bytes,storage_relpath,crypto_format_version,created_at,verified_at) VALUES (?1,?2,?3,?4,1,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                params![blob_id, staged.sha256_hex, i64::try_from(staged.size_bytes).map_err(|_| AppError::new(ErrorCode::Internal))?, blob_relative(&blob_id)?.to_string_lossy()]).map_err(|error| db_error(&error))?;
+        }
+        let item_id = Uuid::new_v4().to_string();
+        tx.execute("INSERT INTO items(id,kind,source_name,source_path_hint,created_at,updated_at,status) VALUES (?1,'FILE',?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'),'IMPORTED')", params![item_id, staged.source_name, staged.source_path_hint]).map_err(|error| db_error(&error))?;
+        tx.execute(
+            "INSERT INTO item_blobs(item_id,blob_id,role) VALUES (?1,?2,'ORIGINAL')",
+            params![item_id, blob_id],
+        )
+        .map_err(|error| db_error(&error))?;
+        crate::jobs::enqueue_verification(&tx, &item_id, &blob_id)?;
+        #[cfg(test)]
+        crate::tests::checkpoint("C7");
+        tx.commit().map_err(|error| db_error(&error))?;
+        #[cfg(test)]
+        crate::tests::checkpoint("C8");
+        Ok(ImportReceipt {
+            item_id,
+            blob_id,
+            sha256_hex: staged.sha256_hex,
+            size_bytes: staged.size_bytes,
+        })
+    }
+}

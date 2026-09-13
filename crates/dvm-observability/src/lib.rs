@@ -186,6 +186,14 @@ pub fn sanitise(value: &str) -> Option<String> {
     }
 }
 
+/// Emits only the canonical classification of a storage failure, never its details.
+/// The structural sanitizer alone cannot redact names; this typed constructor
+/// deliberately excludes message text, path hints and even `safe_details`.
+#[must_use]
+pub fn storage_failure(error: &dvm_domain::AppError) -> DiagnosticEvent {
+    DiagnosticEvent::new("storage_failed").with_field("error_code", error.code.as_wire_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DiagnosticEvent, MAX_FIELD_LEN, sanitise};

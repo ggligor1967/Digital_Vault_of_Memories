@@ -12,4 +12,5 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+dvm-domain.workspace = true
 serde_json = { workspace = true }

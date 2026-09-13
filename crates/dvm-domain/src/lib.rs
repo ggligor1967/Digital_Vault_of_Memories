@@ -46,3 +46,6 @@ pub use foundation::{FoundationHealth, FoundationStatus};
 /// refuses to report a healthy foundation when the value it was compiled
 /// against differs from the value the trusted backend reports.
 pub const API_CONTRACT_VERSION: &str = "1.0.0";
+
+/// Trusted G1 storage contracts.
+pub mod storage;

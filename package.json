@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Digital Vault of Memories — local-first encrypted personal memory vault (Blueprint v2). Gate G0: repository foundation.",
+  "description": "Digital Vault of Memories \u2014 Blueprint v2. G0 closed; G1 storage implementation.",
   "license": "SEE LICENSE IN SECURITY.md",
   "packageManager": "pnpm@10.27.0",
   "engines": {
@@ -28,7 +28,8 @@
     "dev": "tauri dev",
     "tauri:build:smoke": "tauri build --no-bundle",
     "runtime:evidence": "node scripts/runtime-evidence.mjs",
-    "verify:g0": "node scripts/verify-g0.mjs"
+    "verify:g0": "node scripts/verify-g0.mjs",
+    "verify:g1": "node scripts/verify-g1.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

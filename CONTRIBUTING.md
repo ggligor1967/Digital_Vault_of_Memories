@@ -2,11 +2,11 @@
 
 ## The one rule that shapes everything else
 
-Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. The current gate is **G0 — repository foundation**.
+Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. G0 is closed. The current gate is **G1 — zero-loss vault storage**.
 
 This is not process for its own sake. Blueprint v2 replaced an architecture that made guarantees it could not keep, and it did so by ordering the work so that correctness, security and recoverability are proven _before_ the features that depend on them. A change that implements part of G1 while G0 is open does not accelerate anything; it removes the evidence that G0 was ever true.
 
-So: if a change needs a database, a key, an index, a provider or a media pipeline, it belongs to a later gate. Open an issue describing what you wanted to do and which gate it falls under, rather than starting it.
+G1 authorizes native SQLCipher, SQLite access, XChaCha20-Poly1305, HKDF, SHA-256, OS randomness, zeroization and storage correctness/testing dependencies only. Argon2, keyring, AI/model providers, HNSW/search, FFmpeg/media, backup/archive and plugin frameworks remain prohibited.
 
 `tests/security/src/dependency-scope.test.ts` enforces this mechanically. Adding a later-gate dependency fails the build with the gate name in the message.
 
@@ -96,3 +96,16 @@ Two rules about evidence are worth stating plainly, because both are easy to vio
 - **A successful compile is not runtime proof.** Where a gate requires runtime behaviour, it requires a captured, mechanical observation of that behaviour — for G0, that is `pnpm runtime:evidence`.
 
 Do not report `PASS` for a step you skipped. `pnpm verify:g0` reports skipped steps as skipped for exactly this reason.
+
+## G1 acceptance
+
+Run `pnpm verify:g1` before a candidate commit. Tests must use real SQLCipher,
+DVB1 originals, restart equality, transactional failure injection and child-process
+crashes at C1–C8. Returned errors alone are not crash evidence. The >2 GiB test is
+mandatory locally and in the clean room. Never count a skipped gate as PASS.
+No renderer permission expansion, production empty-keyslot vault creation, raw
+key persistence or G2 features are authorized. Keep all direct dependencies exact.
+
+The single final G1 commit protocol verifies a candidate SHA in a fresh short-path
+checkout, then amends only its evidence document. Source changes invalidate that
+clean-room result. Do not merge the G1 PR in the implementation transaction.
