@@ -1,0 +1,1544 @@
+//! G1 tests, including real child-process termination. Entire module is cfg(test).
+#![allow(clippy::too_many_lines)]
+use crate::Vault;
+use dvm_crypto::{CHUNK_SIZE, DigestReceipt, PlaintextSink, VaultMasterKey, dvb1::sha256};
+use dvm_domain::{
+    AppError, ErrorCode,
+    storage::{ImportRepository, JobRepository, ReconciliationHealth},
+};
+use std::{
+    fs::{self, File},
+    io::{Read, Write},
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::Arc,
+};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+const NOW: u64 = 4_000_000_000;
+
+pub(crate) fn checkpoint(name: &str) {
+    if std::env::var("DVM_G1_TEST_CHECKPOINT").is_ok_and(|point| point == name) {
+        println!("CHECKPOINT {name}");
+        std::process::exit(91); // Real process termination without Rust destructors.
+    }
+}
+pub(crate) struct ChunkCheckpointWriter<'a> {
+    output: &'a mut File,
+    written: usize,
+}
+impl<'a> ChunkCheckpointWriter<'a> {
+    pub(crate) fn new(output: &'a mut File) -> Self {
+        Self { output, written: 0 }
+    }
+}
+impl Write for ChunkCheckpointWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let count = self.output.write(buffer)?;
+        self.written += count;
+        if self.written >= 68 + 12 + CHUNK_SIZE + 16 {
+            checkpoint("C3");
+        }
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
+struct Fixture {
+    root: PathBuf,
+}
+impl Fixture {
+    fn new() -> Result<Self, std::io::Error> {
+        let root = std::env::temp_dir().join(format!("dvm-g1-test-{}", Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        Ok(Self { root })
+    }
+    fn vault_path(&self) -> PathBuf {
+        self.root.join("vault")
+    }
+    fn source(&self, bytes: &[u8]) -> Result<PathBuf, std::io::Error> {
+        let path = self.root.join("Private Photos amintire șárga secretă.jpg");
+        fs::write(&path, bytes)?;
+        Ok(path)
+    }
+    fn create(&self) -> Result<Vault, AppError> {
+        Vault::create_with_injected_key(&self.vault_path(), &key())
+    }
+    fn reopen(&self) -> Result<Vault, AppError> {
+        Vault::open_with_injected_key(&self.vault_path(), &key(), NOW)
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Delete only this uniquely generated fixture root, never a caller-supplied path.
+        if self.root.parent() == Some(std::env::temp_dir().as_path())
+            && self
+                .root
+                .file_name()
+                .is_some_and(|s| s.to_string_lossy().starts_with("dvm-g1-test-"))
+        {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
+fn key() -> VaultMasterKey {
+    VaultMasterKey::from_injected_bytes(Zeroizing::new([11; 32]))
+}
+fn count(vault: &Vault, table: &str) -> Result<i64, AppError> {
+    vault
+        .db()?
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .map_err(|error| crate::database::db_error(&error))
+}
+fn canonical(vault: &Vault, id: &str) -> PathBuf {
+    vault.root.join("blobs").join(format!("{id}.dvb"))
+}
+fn status(vault: &Vault, id: &str) -> Result<String, AppError> {
+    vault
+        .db()?
+        .query_row("SELECT status FROM jobs WHERE id=?1", [id], |r| r.get(0))
+        .map_err(|error| crate::database::db_error(&error))
+}
+
+#[derive(Default)]
+struct BytesSink {
+    staged: Vec<u8>,
+    committed: Vec<u8>,
+    aborted: bool,
+}
+impl PlaintextSink for BytesSink {
+    fn stage(&mut self, chunk: &[u8]) -> Result<(), AppError> {
+        self.staged.extend_from_slice(chunk);
+        Ok(())
+    }
+    fn commit(&mut self, _: &DigestReceipt) -> Result<(), AppError> {
+        self.committed = std::mem::take(&mut self.staged);
+        Ok(())
+    }
+    fn abort(&mut self) {
+        self.staged.clear();
+        self.committed.clear();
+        self.aborted = true;
+    }
+}
+
+#[test]
+fn encrypted_sqlcipher_reopen_wrong_key_and_live_wal() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    println!("SQLCIPHER {:?}", vault.cipher);
+    // Regression: optional global locking recurses in the Windows warning logger
+    // when VirtualLock reaches its quota. Cryptographic allocations still wipe.
+    let global_memory_security: String =
+        vault
+            .db()?
+            .pragma_query_value(None, "cipher_memory_security", |row| row.get(0))?;
+    assert_eq!(global_memory_security, "0");
+    let sentinel = "G1_AT_REST_SENTINEL_UNIQUE_RECOGNIZABLE";
+    vault.db()?.execute_batch(
+        "PRAGMA wal_autocheckpoint=0; CREATE TABLE g1_sentinel(value TEXT NOT NULL);",
+    )?;
+    vault.db()?.execute(
+        "INSERT INTO g1_sentinel VALUES (?1)",
+        [sentinel.repeat(200)],
+    )?;
+    for path in [
+        vault.root.join("metadata.db"),
+        vault.root.join("metadata.db-wal"),
+    ] {
+        let bytes = fs::read(path)?;
+        assert!(
+            !bytes
+                .windows(sentinel.len())
+                .any(|w| w == sentinel.as_bytes())
+        );
+        assert!(!bytes.starts_with(b"SQLite format 3"));
+    }
+    crate::database::integrity(&*vault.db()?)?;
+    drop(vault);
+    let wrong = VaultMasterKey::from_injected_bytes(Zeroizing::new([12; 32]));
+    let before = fs::read(fixture.vault_path().join("metadata.db"))?;
+    assert!(
+        !before
+            .windows(sentinel.len())
+            .any(|window| window == sentinel.as_bytes())
+    );
+    assert_eq!(
+        Vault::open_with_injected_key(&fixture.vault_path(), &wrong, NOW)
+            .err()
+            .ok_or("wrong key accepted")?
+            .code,
+        ErrorCode::CorruptDatabase
+    );
+    assert_eq!(before, fs::read(fixture.vault_path().join("metadata.db"))?);
+    let reopened = fixture.reopen()?;
+    let value: String = reopened
+        .db()?
+        .query_row("SELECT value FROM g1_sentinel", [], |r| r.get(0))?;
+    assert_eq!(value, sentinel.repeat(200));
+    assert_eq!(reopened.cipher.journal_mode, "wal");
+    Ok(())
+}
+
+#[test]
+fn schema_identity_foreign_keys_and_future_version_refusal() -> TestResult {
+    // Schema checksum must bind identical bytes in Windows and clean checkouts.
+    assert!(!crate::database::SCHEMA.contains('\r'));
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    assert!(vault.db()?.execute("INSERT INTO item_blobs(item_id,blob_id,role) VALUES ('missing','missing','ORIGINAL')",[]).is_err());
+    assert_eq!(
+        vault
+            .db()?
+            .pragma_query_value(None, "foreign_keys", |r| r.get::<_, i64>(0))?,
+        1
+    );
+    vault.db()?.pragma_update(None, "user_version", 99)?;
+    drop(vault);
+    let before = fs::read(fixture.vault_path().join("metadata.db"))?;
+    assert_eq!(
+        fixture.reopen().err().ok_or("future schema accepted")?.code,
+        ErrorCode::MigrationRequired
+    );
+    assert_eq!(before, fs::read(fixture.vault_path().join("metadata.db"))?);
+    Ok(())
+}
+
+#[test]
+fn restart_recovers_exact_original_and_encrypted_private_metadata() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let source = vec![31; CHUNK_SIZE + 1];
+    let path = fixture.source(&source)?;
+    let imported = dvm_application::storage::import(&vault, &path)?;
+    assert_eq!(imported.sha256_hex, sha256(&source));
+    assert_eq!(count(&vault, "blobs")?, 1);
+    assert_eq!(count(&vault, "items")?, 1);
+    assert_eq!(count(&vault, "item_blobs")?, 1);
+    assert_eq!(count(&vault, "jobs")?, 1);
+    let rel = canonical(&vault, &imported.blob_id);
+    assert!(!rel.to_string_lossy().contains(&imported.sha256_hex));
+    assert!(!rel.to_string_lossy().contains("Private Photos"));
+    assert!(fs::read_dir(vault.root.join("tmp"))?.next().is_none());
+    drop(vault);
+    let vault = fixture.reopen()?;
+    let mut sink = BytesSink::default();
+    let recovered = vault.recover(&imported.blob_id, &mut sink)?;
+    assert_eq!(sink.committed, source);
+    assert_eq!(recovered.sha256_hex, imported.sha256_hex);
+    assert_eq!(recovered.size_bytes, source.len() as u64);
+    println!(
+        "RESTART_RECOVERY source=stored=recovered SHA256 {} bytes {}",
+        recovered.sha256_hex, recovered.size_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn identical_and_concurrent_imports_share_one_immutable_blob() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = Arc::new(fixture.create()?);
+    let path = fixture.source(&[1, 2, 3, 4])?;
+    let first = dvm_application::storage::import(vault.as_ref(), &path)?;
+    let before = fs::read(canonical(&vault, &first.blob_id))?;
+    let second = dvm_application::storage::import(vault.as_ref(), &path)?;
+    assert_ne!(first.item_id, second.item_id);
+    assert_eq!(first.blob_id, second.blob_id);
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let vault = Arc::clone(&vault);
+            let path = path.clone();
+            std::thread::spawn(move || dvm_application::storage::import(vault.as_ref(), &path))
+        })
+        .collect();
+    for thread in threads {
+        assert_eq!(
+            thread.join().map_err(|_| "thread panic")??.blob_id,
+            first.blob_id
+        );
+    }
+    assert_eq!(count(&vault, "blobs")?, 1);
+    assert_eq!(count(&vault, "items")?, 4);
+    assert_eq!(count(&vault, "item_blobs")?, 4);
+    assert_eq!(fs::read_dir(vault.root.join("blobs"))?.count(), 1);
+    assert_eq!(fs::read(canonical(&vault, &first.blob_id))?, before);
+    Ok(())
+}
+
+#[test]
+fn same_hash_different_size_is_integrity_failure() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let path = fixture.source(&[4, 5, 6])?;
+    let first = dvm_application::storage::import(&vault, &path)?;
+    vault.db()?.execute(
+        "UPDATE blobs SET size_bytes=size_bytes+1 WHERE id=?1",
+        [first.blob_id],
+    )?;
+    assert_eq!(
+        dvm_application::storage::import(&vault, &path)
+            .err()
+            .ok_or("anomaly accepted")?
+            .code,
+        ErrorCode::CorruptDatabase
+    );
+    assert_eq!(count(&vault, "items")?, 1);
+    assert_eq!(count(&vault, "blobs")?, 1);
+    Ok(())
+}
+
+#[test]
+fn concurrent_first_imports_commit_only_one_canonical_blob() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = Arc::new(fixture.create()?);
+    let source = fixture.source(&[1, 5, 9, 3])?;
+    let staged_together = Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let vault = Arc::clone(&vault);
+            let barrier = Arc::clone(&staged_together);
+            let source = source.clone();
+            std::thread::spawn(move || {
+                let staged = vault.stage_import(&source);
+                barrier.wait();
+                vault.commit_import(staged?)
+            })
+        })
+        .collect();
+    let receipts = workers
+        .into_iter()
+        .map(|worker| {
+            worker
+                .join()
+                .map_err(|_| "worker panic")?
+                .map_err(Into::into)
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    assert_eq!(receipts[0].blob_id, receipts[1].blob_id);
+    assert_ne!(receipts[0].item_id, receipts[1].item_id);
+    assert_eq!(count(&vault, "blobs")?, 1);
+    assert_eq!(count(&vault, "items")?, 2);
+    assert_eq!(count(&vault, "item_blobs")?, 2);
+    assert_eq!(fs::read_dir(vault.root.join("blobs"))?.count(), 1);
+    assert_eq!(fs::read_dir(vault.root.join("tmp"))?.count(), 0);
+    drop(vault);
+    let vault = fixture.reopen()?;
+    let mut sink = BytesSink::default();
+    vault.recover(&receipts[0].blob_id, &mut sink)?;
+    assert_eq!(sink.committed, [1, 5, 9, 3]);
+    Ok(())
+}
+
+#[test]
+fn failed_insert_and_deferred_constraint_commit_never_succeed() -> TestResult {
+    for failure in [
+        "CREATE TRIGGER reject_item BEFORE INSERT ON items BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        "CREATE TABLE failure_parent(id TEXT PRIMARY KEY); CREATE TABLE failure_child(id TEXT REFERENCES failure_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_commit AFTER INSERT ON items BEGIN INSERT INTO failure_child VALUES ('missing'); END;",
+    ] {
+        let fixture = Fixture::new()?;
+        let vault = fixture.create()?;
+        let path = fixture.source(&[1, 9, 5])?;
+        vault.db()?.execute_batch(failure)?;
+        assert!(dvm_application::storage::import(&vault, &path).is_err());
+        for table in ["items", "blobs", "item_blobs", "jobs"] {
+            assert_eq!(count(&vault, table)?, 0);
+        }
+        drop(vault);
+        let vault = fixture.reopen()?;
+        assert_eq!(vault.reconciliation.quarantined_orphans, 1);
+        assert_eq!(fs::read_dir(vault.root.join("quarantine"))?.count(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn missing_mutated_truncated_and_substituted_originals_fail_closed() -> TestResult {
+    for mutation in ["missing", "flip", "truncate", "swap"] {
+        let fixture = Fixture::new()?;
+        let vault = fixture.create()?;
+        let path = fixture.source(&vec![3; CHUNK_SIZE + 1])?;
+        let first = dvm_application::storage::import(&vault, &path)?;
+        let stored = canonical(&vault, &first.blob_id);
+        match mutation {
+            "missing" => fs::remove_file(&stored)?,
+            "flip" => {
+                let mut bytes = fs::read(&stored)?;
+                bytes[80] ^= 1;
+                fs::write(&stored, bytes)?;
+            }
+            "truncate" => {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&stored)?
+                    .set_len(90)?;
+            }
+            _ => {
+                let second =
+                    dvm_application::storage::import(&vault, &fixture.source(&[7, 8, 9])?)?;
+                fs::copy(canonical(&vault, &second.blob_id), &stored)?;
+            }
+        }
+        let mut sink = BytesSink::default();
+        let error = vault
+            .recover(&first.blob_id, &mut sink)
+            .err()
+            .ok_or("corruption accepted")?;
+        assert_eq!(
+            error.code,
+            if mutation == "missing" {
+                ErrorCode::MissingBlob
+            } else {
+                ErrorCode::BlobAuthFailed
+            }
+        );
+        assert!(sink.committed.is_empty() && sink.staged.is_empty() && sink.aborted);
+        drop(vault);
+        let vault = fixture.reopen()?;
+        assert_eq!(
+            vault.reconciliation.health,
+            ReconciliationHealth::RepairRequired
+        );
+        let item_status: String = vault.db()?.query_row(
+            "SELECT status FROM items WHERE id=?1",
+            [first.item_id],
+            |r| r.get(0),
+        )?;
+        assert_eq!(item_status, "CORRUPTED");
+    }
+    Ok(())
+}
+
+#[test]
+fn durable_jobs_lease_recovery_retries_terminal_and_replay() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    dvm_application::storage::import(&vault, &fixture.source(&[8, 2, 5])?)?;
+    drop(vault);
+    let vault = fixture.reopen()?;
+    let lease = vault.claim_job(NOW, 60)?.ok_or("no job")?;
+    assert_eq!(lease.attempt, 1);
+    assert_eq!(status(&vault, &lease.id)?, "PROCESSING");
+    assert!(vault.claim_job(NOW, 60)?.is_none());
+    drop(vault);
+    let vault = fixture.reopen()?;
+    assert_eq!(status(&vault, &lease.id)?, "PROCESSING");
+    drop(vault);
+    let vault = Vault::open_with_injected_key(&fixture.vault_path(), &key(), NOW + 61)?;
+    assert_eq!(status(&vault, &lease.id)?, "PENDING");
+    let second = vault.claim_job(NOW + 61, 60)?.ok_or("no retry")?;
+    assert_eq!(second.attempt, 2);
+    assert!(vault.complete_job(&lease, NOW + 61).is_err());
+    vault.complete_job(&second, NOW + 61)?;
+    vault.complete_job(&second, NOW + 62)?;
+    assert_eq!(status(&vault, &second.id)?, "DONE");
+    assert_eq!(count(&vault, "blobs")?, 1);
+    dvm_application::storage::import(&vault, &fixture.source(&[9, 2, 5])?)?;
+    let mut now = NOW + 100;
+    for attempt in 1..=5 {
+        let lease = vault.claim_job(now, 60)?.ok_or("retry missing")?;
+        assert_eq!(lease.attempt, attempt);
+        vault.fail_job(&lease, now, true)?;
+        assert_eq!(
+            status(&vault, &lease.id)?,
+            if attempt < 5 {
+                "PENDING"
+            } else {
+                "FAILED_TERMINAL"
+            }
+        );
+        assert!(vault.claim_job(now, 60)?.is_none());
+        now += 600;
+    }
+    Ok(())
+}
+
+#[test]
+fn job_result_commit_failure_is_not_done_and_rolls_back_result() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let receipt = dvm_application::storage::import(&vault, &fixture.source(&[7, 1, 3])?)?;
+    let lease = vault.claim_job(NOW, 60)?.ok_or("no job")?;
+    let before: String = vault.db()?.query_row(
+        "SELECT verified_at FROM blobs WHERE id=?1",
+        [receipt.blob_id.clone()],
+        |r| r.get(0),
+    )?;
+    vault.db()?.execute_batch("CREATE TRIGGER reject_done BEFORE UPDATE OF status ON jobs WHEN NEW.status='DONE' BEGIN SELECT RAISE(ABORT,'injected'); END;")?;
+    assert!(vault.complete_job(&lease, NOW).is_err());
+    assert_eq!(status(&vault, &lease.id)?, "PROCESSING");
+    let after: String = vault.db()?.query_row(
+        "SELECT verified_at FROM blobs WHERE id=?1",
+        [receipt.blob_id],
+        |r| r.get(0),
+    )?;
+    assert_eq!(before, after);
+    Ok(())
+}
+
+#[test]
+fn payload_idempotency_cancellation_and_exclusive_owner() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    assert_eq!(
+        fixture.reopen().err().ok_or("second owner admitted")?.code,
+        ErrorCode::VaultLocked
+    );
+    let receipt = dvm_application::storage::import(&vault, &fixture.source(&[3, 1, 8])?)?;
+    assert!(
+        crate::jobs::enqueue_verification(&*vault.db()?, &receipt.item_id, &receipt.blob_id)
+            .is_err()
+    );
+    let (id, payload): (String, String) =
+        vault
+            .db()?
+            .query_row("SELECT id,payload_json FROM jobs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&payload)?
+            .as_object()
+            .ok_or("not object")?
+            .len(),
+        2
+    );
+    assert!(payload.len() < 256);
+    assert!(!payload.contains("Private"));
+    vault.cancel_pending_job(&id)?;
+    assert_eq!(status(&vault, &id)?, "CANCELLED");
+    assert!(vault.claim_job(NOW, 60)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[ignore = "only invoked as a named child of the crash matrix"]
+fn crash_child() -> TestResult {
+    let root = PathBuf::from(std::env::var("DVM_G1_TEST_ROOT")?);
+    let source = PathBuf::from(std::env::var("DVM_G1_TEST_SOURCE")?);
+    let mut bytes = Zeroizing::new([0; 32]);
+    std::io::stdin().read_exact(bytes.as_mut())?;
+    let key = VaultMasterKey::from_injected_bytes(bytes);
+    let vault = Vault::open_with_injected_key(&root, &key, NOW)?;
+    let receipt = dvm_application::storage::import(&vault, &source)?;
+    if std::env::var("DVM_G1_TEST_CHECKPOINT")? == "JOB_COMMIT" {
+        let lease = vault.claim_job(NOW, 60)?.ok_or("missing child job")?;
+        vault.complete_job(&lease, NOW)?;
+    }
+    println!("IMPORT_SUCCESS {}", receipt.item_id);
+    Err("checkpoint not reached".into())
+}
+
+#[test]
+fn real_process_crash_matrix_c1_through_c8_and_job_commit() -> TestResult {
+    for point in ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "JOB_COMMIT"] {
+        let fixture = Fixture::new()?;
+        drop(fixture.create()?);
+        let source = vec![13; CHUNK_SIZE + 1];
+        let path = fixture.source(&source)?;
+        let mut child = Command::new(std::env::current_exe()?)
+            .args(["--exact", "tests::crash_child", "--ignored", "--nocapture"])
+            .env("DVM_G1_TEST_ROOT", fixture.vault_path())
+            .env("DVM_G1_TEST_SOURCE", path)
+            .env("DVM_G1_TEST_CHECKPOINT", point)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or("missing child stdin")?
+            .write_all(&[11; 32])?;
+        let output = child.wait_with_output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(91),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("IMPORT_SUCCESS"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("CHECKPOINT {point}")));
+        let vault = Vault::open_with_injected_key(&fixture.vault_path(), &key(), NOW + 100)?;
+        let committed = matches!(point, "C8" | "JOB_COMMIT");
+        for table in ["blobs", "items", "item_blobs", "jobs"] {
+            assert_eq!(
+                count(&vault, table)?,
+                i64::from(committed),
+                "{point} {table}"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(vault.root.join("blobs"))?.count(),
+            usize::from(committed)
+        );
+        assert_eq!(fs::read_dir(vault.root.join("tmp"))?.count(), 0);
+        if matches!(point, "C6" | "C7") {
+            assert_eq!(vault.reconciliation.quarantined_orphans, 1);
+        }
+        if matches!(point, "C2" | "C3" | "C4" | "C5") {
+            assert_eq!(vault.reconciliation.quarantined_staging, 1);
+        }
+        if committed {
+            let id: String = vault
+                .db()?
+                .query_row("SELECT id FROM blobs", [], |r| r.get(0))?;
+            let mut sink = BytesSink::default();
+            vault.recover(&id, &mut sink)?;
+            assert_eq!(sink.committed, source);
+            if point == "JOB_COMMIT" {
+                let job_status: String =
+                    vault
+                        .db()?
+                        .query_row("SELECT status FROM jobs", [], |r| r.get(0))?;
+                assert_eq!(job_status, "PENDING");
+            }
+        }
+        println!("CRASH {point} PASS committed={committed} no_false_success=true");
+    }
+    Ok(())
+}
+
+#[test]
+fn private_paths_never_cross_storage_error_or_diagnostic_boundary() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let private = fixture
+        .root
+        .join("Private Photos")
+        .join("amintire șárga secretă.jpg");
+    let error = dvm_application::storage::import(&vault, &private)
+        .err()
+        .ok_or("missing source succeeded")?;
+    assert_eq!(error.code, ErrorCode::SourceUnreadable);
+    let serialized = serde_json::to_string(&error)?;
+    let diagnostic = dvm_observability::storage_failure(&error).to_json_line();
+    for output in [&serialized, &diagnostic] {
+        assert!(!output.contains("Private"));
+        assert!(!output.contains("amintire"));
+        assert!(!output.contains("secret"));
+    }
+    let internal =
+        AppError::new(ErrorCode::SourceUnreadable).with_safe_details(private.to_string_lossy());
+    assert!(
+        !dvm_observability::storage_failure(&internal)
+            .to_json_line()
+            .contains("Private")
+    );
+    Ok(())
+}
+
+#[test]
+fn exhausted_expired_lease_becomes_terminal() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    dvm_application::storage::import(&vault, &fixture.source(&[3])?)?;
+    vault.db()?.execute("UPDATE jobs SET max_attempts=1", [])?;
+    let lease = vault.claim_job(NOW, 1)?.ok_or("no lease")?;
+    drop(vault);
+    let vault = Vault::open_with_injected_key(&fixture.vault_path(), &key(), NOW + 2)?;
+    assert_eq!(status(&vault, &lease.id)?, "FAILED_TERMINAL");
+    assert!(vault.claim_job(NOW + 2, 60)?.is_none());
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_measure(expression: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", expression])
+        .output()?;
+    if !output.status.success() {
+        return Err("measurement failed".into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().parse()?)
+}
+
+#[test]
+#[ignore = "mandatory local heavyweight gate; verify:g1 invokes this explicitly"]
+#[cfg(windows)]
+fn multi_gb_bounded_memory() -> TestResult {
+    use sha2::{Digest, Sha256};
+    struct CompareSink {
+        source: File,
+        buffer: Vec<u8>,
+        count: u64,
+        committed: bool,
+    }
+    impl PlaintextSink for CompareSink {
+        fn stage(&mut self, chunk: &[u8]) -> Result<(), AppError> {
+            self.source
+                .read_exact(&mut self.buffer[..chunk.len()])
+                .map_err(|_| AppError::new(ErrorCode::SourceUnreadable))?;
+            if &self.buffer[..chunk.len()] != chunk {
+                return Err(AppError::new(ErrorCode::BlobAuthFailed));
+            }
+            self.count += chunk.len() as u64;
+            Ok(())
+        }
+        fn commit(&mut self, receipt: &DigestReceipt) -> Result<(), AppError> {
+            let mut extra = [0];
+            if self.count != receipt.size_bytes
+                || self
+                    .source
+                    .read(&mut extra)
+                    .map_err(|_| AppError::new(ErrorCode::SourceUnreadable))?
+                    != 0
+            {
+                return Err(AppError::new(ErrorCode::BlobAuthFailed));
+            }
+            self.committed = true;
+            Ok(())
+        }
+        fn abort(&mut self) {
+            self.count = 0;
+            self.committed = false;
+        }
+    }
+    let size = 2 * 1024 * 1024 * 1024_u64 + CHUNK_SIZE as u64;
+    let disk_expression = "(Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='C:'\").FreeSpace";
+    let free_before = windows_measure(disk_expression)?;
+    if free_before < 2 * size + 2 * 1024 * 1024 * 1024 {
+        return Err("BLOCKED_BY_DISK_PRESSURE".into());
+    }
+    let baseline = windows_measure(&format!(
+        "(Get-Process -Id {}).WorkingSet64",
+        std::process::id()
+    ))?;
+    let started = std::time::Instant::now();
+    let fixture = Fixture::new()?;
+    let source_path = fixture.root.join("multi gb source.bin");
+    let mut original = File::create(&source_path)?;
+    let pattern: Vec<u8> = (0..CHUNK_SIZE).map(|i| i.to_le_bytes()[0]).collect();
+    let mut expected_hash = Sha256::new();
+    for _ in 0..size / CHUNK_SIZE as u64 {
+        original.write_all(&pattern)?;
+        expected_hash.update(&pattern);
+    }
+    original.sync_all()?;
+    drop(original);
+    drop(pattern);
+    let source_hash = dvm_crypto::dvb1::hex(expected_hash.finalize().as_slice());
+    let vault = fixture.create()?;
+    let imported = dvm_application::storage::import(&vault, &source_path)?;
+    assert_eq!(imported.size_bytes, size);
+    assert_eq!(imported.sha256_hex, source_hash);
+    drop(vault);
+    let vault = fixture.reopen()?;
+    let mut sink = CompareSink {
+        source: File::open(&source_path)?,
+        buffer: vec![0; CHUNK_SIZE],
+        count: 0,
+        committed: false,
+    };
+    let recovered = vault.recover(&imported.blob_id, &mut sink)?;
+    assert!(sink.committed);
+    assert_eq!(sink.count, size);
+    assert_eq!(recovered.sha256_hex, source_hash);
+    let peak = windows_measure(&format!(
+        "(Get-Process -Id {}).PeakWorkingSet64",
+        std::process::id()
+    ))?;
+    let free_after = windows_measure(disk_expression)?;
+    println!(
+        "MULTI_GB size={size} sparse=false chunk={CHUNK_SIZE} largest_buffer={} configured_crypto_buffers={} source_sha256={source_hash} recovered_sha256={} recovered_bytes={} baseline_working_set={baseline} peak_working_set={peak} incremental_estimate={} elapsed_seconds={:.3} disk_before={free_before} disk_after={free_after} BYTE_EQUALITY=PASS BOUNDED_MEMORY=PASS",
+        CHUNK_SIZE + 16,
+        2 * CHUNK_SIZE + 16,
+        recovered.sha256_hex,
+        recovered.size_bytes,
+        peak.saturating_sub(baseline),
+        started.elapsed().as_secs_f64()
+    );
+    drop(sink);
+    drop(vault);
+    drop(fixture);
+    println!(
+        "MULTI_GB fixtures removed disk_after_cleanup={}",
+        windows_measure(disk_expression)?
+    );
+    Ok(())
+}
+
+#[test]
+fn native_connection_interruption_rolls_back_import() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let path = fixture.source(&[2, 4, 9])?;
+    let staged = vault.stage_import(&path)?;
+    vault.db()?.execute_batch("CREATE TRIGGER delay_item BEFORE INSERT ON items BEGIN SELECT sum(n) FROM (WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<1000000000) SELECT n FROM numbers); END;")?;
+    let interrupt = vault.db()?.get_interrupt_handle();
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = Arc::clone(&completed);
+    let interrupter = std::thread::spawn(move || {
+        while !finished.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            interrupt.interrupt();
+        }
+    });
+    let result = vault.commit_import(staged);
+    completed.store(true, std::sync::atomic::Ordering::Relaxed);
+    interrupter.join().map_err(|_| "interrupt thread panic")?;
+    assert!(result.is_err());
+    for table in ["items", "blobs", "item_blobs", "jobs"] {
+        assert_eq!(count(&vault, table)?, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn nonretryable_job_fails_terminal_and_schema_checksum_tampering_is_rejected() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    dvm_application::storage::import(&vault, &fixture.source(&[2, 3, 4])?)?;
+    let lease = vault.claim_job(NOW, 60)?.ok_or("missing job")?;
+    vault.fail_job(&lease, NOW, false)?;
+    assert_eq!(status(&vault, &lease.id)?, "FAILED_TERMINAL");
+    vault
+        .db()?
+        .execute("UPDATE schema_migrations SET checksum='tampered'", [])?;
+    drop(vault);
+    assert_eq!(
+        fixture.reopen().err().ok_or("checksum accepted")?.code,
+        ErrorCode::MigrationFailed
+    );
+    Ok(())
+}
+
+#[test]
+fn application_job_use_case_commits_one_result() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    assert!(!dvm_application::storage::run_one_job(&vault, NOW)?);
+    dvm_application::storage::import(&vault, &fixture.source(&[1, 4, 7])?)?;
+    assert!(dvm_application::storage::run_one_job(&vault, NOW)?);
+    assert!(!dvm_application::storage::run_one_job(&vault, NOW)?);
+    let done: i64 =
+        vault
+            .db()?
+            .query_row("SELECT count(*) FROM jobs WHERE status='DONE'", [], |r| {
+                r.get(0)
+            })?;
+    assert_eq!(done, 1);
+    Ok(())
+}
+
+#[test]
+fn header_and_ciphertext_database_corruption_fail_closed() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    dvm_application::storage::import(&vault, &fixture.source(&[9, 4, 7])?)?;
+    drop(vault);
+    let database = fixture.vault_path().join("metadata.db");
+    let mut bytes = fs::read(&database)?;
+    bytes[100] ^= 1;
+    fs::write(&database, bytes)?;
+    assert_eq!(
+        fixture.reopen().err().ok_or("DB corruption accepted")?.code,
+        ErrorCode::CorruptDatabase
+    );
+    fs::write(fixture.vault_path().join("vault.header"), b"{truncated")?;
+    assert_eq!(
+        fixture
+            .reopen()
+            .err()
+            .ok_or("header corruption accepted")?
+            .code,
+        ErrorCode::CorruptHeader
+    );
+    Ok(())
+}
+
+#[test]
+fn deferred_job_commit_failure_rolls_back_done_and_verified_at() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let imported = dvm_application::storage::import(&vault, &fixture.source(&[3, 8, 2])?)?;
+    let lease = vault.claim_job(NOW, 60)?.ok_or("no lease")?;
+    let before: String = vault.db()?.query_row(
+        "SELECT verified_at FROM blobs WHERE id=?1",
+        [&imported.blob_id],
+        |row| row.get(0),
+    )?;
+    vault.db()?.execute_batch("CREATE TABLE job_failure_parent(id TEXT PRIMARY KEY); CREATE TABLE job_failure_child(id TEXT REFERENCES job_failure_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_job_commit AFTER UPDATE OF status ON jobs WHEN NEW.status='DONE' BEGIN INSERT INTO job_failure_child VALUES ('missing'); END;")?;
+    assert!(vault.complete_job(&lease, NOW).is_err());
+    assert_eq!(status(&vault, &lease.id)?, "PROCESSING");
+    let after: String = vault.db()?.query_row(
+        "SELECT verified_at FROM blobs WHERE id=?1",
+        [&imported.blob_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(before, after);
+    assert_eq!(count(&vault, "job_failure_child")?, 0);
+    Ok(())
+}
+
+/// Canonical blob metadata timestamp grammar: `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+/// Every writer of `blobs.verified_at` must produce exactly this shape.
+fn is_canonical_utc_iso(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 24
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22]
+            .iter()
+            .all(|&index| bytes[index].is_ascii_digit())
+}
+
+#[test]
+fn operational_canonical_io_is_never_reported_as_a_missing_blob() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let imported = dvm_application::storage::import(&vault, &fixture.source(&[5, 5, 9])?)?;
+
+    // R1-B: the canonical original is present and intact, but this open fails
+    // for an operational reason. "Cannot read it right now" must never be
+    // recorded as "the canonical original is gone".
+    assert!(canonical(&vault, &imported.blob_id).is_file());
+    crate::vault::OPEN_FAULT.with(|fault| fault.set(Some(std::io::ErrorKind::PermissionDenied)));
+    let mut blocked = BytesSink::default();
+    let operational = vault
+        .recover(&imported.blob_id, &mut blocked)
+        .err()
+        .ok_or("operational I/O failure accepted")?;
+    assert_ne!(operational.code, ErrorCode::MissingBlob);
+    assert_ne!(operational.code, ErrorCode::BlobAuthFailed);
+    assert_eq!(operational.code, ErrorCode::Internal);
+    assert!(blocked.aborted && blocked.committed.is_empty() && blocked.staged.is_empty());
+
+    // No false condemnation, and write admission is untouched.
+    let untouched: String = vault.db()?.query_row(
+        "SELECT status FROM items WHERE id=?1",
+        [&imported.item_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(untouched, "IMPORTED");
+    assert_eq!(vault.health(), ReconciliationHealth::Healthy);
+    let second = dvm_application::storage::import(&vault, &fixture.source(&[6, 6, 1])?)?;
+    assert_ne!(second.blob_id, imported.blob_id);
+
+    // A transient failure is transient: the same original still recovers whole.
+    let mut restored = BytesSink::default();
+    vault.recover(&imported.blob_id, &mut restored)?;
+    assert_eq!(restored.committed, vec![5, 5, 9]);
+
+    // R1-D: neither envelope nor diagnostic may carry the canonical path.
+    let serialized = serde_json::to_string(&operational)?;
+    let diagnostic = dvm_observability::storage_failure(&operational).to_json_line();
+    for output in [&serialized, &diagnostic] {
+        assert!(!output.contains(&imported.blob_id));
+        assert!(!output.contains("blobs"));
+        assert!(!output.contains(".dvb"));
+        assert!(!output.to_ascii_lowercase().contains("denied"));
+        assert!(!output.contains("Private"));
+    }
+    assert!(operational.safe_details.is_none());
+
+    // R1-A: only a genuinely absent canonical file is MissingBlob, and that one
+    // does condemn the item.
+    fs::remove_file(canonical(&vault, &imported.blob_id))?;
+    let mut absent = BytesSink::default();
+    let missing = vault
+        .recover(&imported.blob_id, &mut absent)
+        .err()
+        .ok_or("absent canonical original accepted")?;
+    assert_eq!(missing.code, ErrorCode::MissingBlob);
+    let condemned: String = vault.db()?.query_row(
+        "SELECT status FROM items WHERE id=?1",
+        [&imported.item_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(condemned, "CORRUPTED");
+    let leaked = serde_json::to_string(&missing)?;
+    assert!(!leaked.contains(".dvb") && !leaked.contains("blobs"));
+    Ok(())
+}
+
+#[test]
+fn runtime_canonical_corruption_latches_repair_required_and_blocks_writes() -> TestResult {
+    // R1-C is exercised by the "corrupt" arm: authentication failure of a
+    // present canonical original must behave exactly like data loss.
+    for mutation in ["missing", "corrupt"] {
+        let fixture = Fixture::new()?;
+        let vault = fixture.create()?;
+        assert_eq!(vault.health(), ReconciliationHealth::Healthy);
+        let imported = dvm_application::storage::import(&vault, &fixture.source(&[4, 2, 7])?)?;
+        let lease = vault.claim_job(NOW, 60)?.ok_or("no verification job")?;
+
+        // Damage the canonical original *after* startup reconciliation ran.
+        let stored = canonical(&vault, &imported.blob_id);
+        if mutation == "missing" {
+            fs::remove_file(&stored)?;
+        } else {
+            let mut bytes = fs::read(&stored)?;
+            bytes[80] ^= 1;
+            fs::write(&stored, bytes)?;
+        }
+
+        let mut sink = BytesSink::default();
+        let error = vault
+            .recover(&imported.blob_id, &mut sink)
+            .err()
+            .ok_or("runtime corruption accepted")?;
+        assert_eq!(
+            error.code,
+            if mutation == "missing" {
+                ErrorCode::MissingBlob
+            } else {
+                ErrorCode::BlobAuthFailed
+            }
+        );
+        let item_status: String = vault.db()?.query_row(
+            "SELECT status FROM items WHERE id=?1",
+            [&imported.item_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(item_status, "CORRUPTED");
+
+        // The startup snapshot is still Healthy; live admission must not be.
+        assert_eq!(vault.reconciliation.health, ReconciliationHealth::Healthy);
+        assert_eq!(vault.health(), ReconciliationHealth::RepairRequired);
+
+        // Every mutation entry point guarded by require_writable is now closed,
+        // and each refuses before touching canonical state.
+        assert_eq!(
+            dvm_application::storage::import(&vault, &fixture.source(&[1, 1, 2])?)
+                .err()
+                .ok_or("import admitted after runtime corruption")?
+                .code,
+            ErrorCode::MissingBlob
+        );
+        assert_eq!(
+            vault
+                .claim_job(NOW, 60)
+                .err()
+                .ok_or("job claim admitted after runtime corruption")?
+                .code,
+            ErrorCode::MissingBlob
+        );
+        assert_eq!(
+            vault
+                .complete_job(&lease, NOW)
+                .err()
+                .ok_or("job completion admitted after runtime corruption")?
+                .code,
+            ErrorCode::MissingBlob
+        );
+        assert_eq!(status(&vault, &lease.id)?, "PROCESSING");
+        assert_eq!(count(&vault, "blobs")?, 1);
+
+        // Sticky: G1 has no repair operation, so nothing clears this.
+        assert_eq!(vault.health(), ReconciliationHealth::RepairRequired);
+
+        // Thread-safe and visible to every concurrent caller of the shared vault.
+        let shared = Arc::new(vault);
+        let watchers: Vec<_> = (0..4)
+            .map(|_| {
+                let vault = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    (
+                        vault.health(),
+                        vault.claim_job(NOW, 60).err().map(|error| error.code),
+                    )
+                })
+            })
+            .collect();
+        for watcher in watchers {
+            let (health, refusal) = watcher.join().map_err(|_| "watcher panicked")?;
+            assert_eq!(health, ReconciliationHealth::RepairRequired);
+            assert_eq!(refusal, Some(ErrorCode::MissingBlob));
+        }
+
+        // A fresh instance reaches the same verdict from durable state alone.
+        drop(shared);
+        let reopened = fixture.reopen()?;
+        assert_eq!(
+            reopened.reconciliation.health,
+            ReconciliationHealth::RepairRequired
+        );
+        assert_eq!(reopened.health(), ReconciliationHealth::RepairRequired);
+    }
+    Ok(())
+}
+
+/// Releases a waiting mutator from inside `Vault::recover`'s database guard.
+///
+/// `recover` aborts its sink while it still holds that guard and before it
+/// latches repair state, and it does not release the guard until it returns —
+/// which is after the latch. Signalling from `abort` therefore pins the
+/// interleaving deterministically, with no sleeps: the mutator is released
+/// while the discovering thread provably owns the synchronization boundary,
+/// and cannot acquire that boundary itself until the latch is already visible.
+struct RendezvousSink {
+    barrier: Arc<std::sync::Barrier>,
+    signalled: bool,
+}
+impl PlaintextSink for RendezvousSink {
+    fn stage(&mut self, _: &[u8]) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn commit(&mut self, _: &DigestReceipt) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn abort(&mut self) {
+        // `decrypt` also aborts the sink, so release the mutator exactly once.
+        if !self.signalled {
+            self.signalled = true;
+            self.barrier.wait();
+        }
+    }
+}
+
+/// T1 — CASE B: a canonical mutation must never commit after integrity
+/// discovery has already linearized ahead of it.
+#[test]
+fn write_admission_is_linearized_with_integrity_discovery() -> TestResult {
+    for mutator in ["commit_import", "claim_job", "complete_job"] {
+        let fixture = Fixture::new()?;
+        let vault = fixture.create()?;
+        let imported = dvm_application::storage::import(&vault, &fixture.source(&[4, 2, 7])?)?;
+        assert_eq!(vault.health(), ReconciliationHealth::Healthy);
+
+        // Every input the writer needs is prepared while the vault is still
+        // healthy, so its admission decision is the only thing left to order.
+        let staged = if mutator == "commit_import" {
+            let second = fixture.root.join("second import.bin");
+            fs::write(&second, [1, 1, 2])?;
+            Some(vault.stage_import(&second)?)
+        } else {
+            None
+        };
+        let staging_path = staged.as_ref().map(|staged| staged.staging_path.clone());
+        // The lease deliberately targets a *different*, intact canonical
+        // original from the one that will fail. `complete_job` verifies its own
+        // blob before publishing a result, so a lease on the damaged original
+        // would be refused by that check and prove nothing about admission.
+        let lease = if mutator == "complete_job" {
+            let other = fixture.root.join("second original.bin");
+            fs::write(&other, [9, 9, 9])?;
+            let second = dvm_application::storage::import(&vault, &other)?;
+            let mut selected = None;
+            while let Some(lease) = vault.claim_job(NOW, 60)? {
+                if lease.payload.blob_id == second.blob_id {
+                    selected = Some(lease);
+                }
+            }
+            Some(selected.ok_or("no verification job for the intact original")?)
+        } else {
+            None
+        };
+        // What the refused writer would have touched.
+        let watched_blob = lease.as_ref().map_or_else(
+            || imported.blob_id.clone(),
+            |lease| lease.payload.blob_id.clone(),
+        );
+
+        let before = (
+            count(&vault, "blobs")?,
+            count(&vault, "items")?,
+            count(&vault, "item_blobs")?,
+            count(&vault, "jobs")?,
+        );
+        let job_id: String = match &lease {
+            Some(lease) => lease.id.clone(),
+            None => vault
+                .db()?
+                .query_row("SELECT id FROM jobs LIMIT 1", [], |row| row.get(0))?,
+        };
+        let job_before = status(&vault, &job_id)?;
+        let verified_before: Option<String> = vault.db()?.query_row(
+            "SELECT verified_at FROM blobs WHERE id=?1",
+            [&watched_blob],
+            |row| row.get(0),
+        )?;
+
+        // Damage the canonical original after startup reconciliation ran.
+        fs::remove_file(canonical(&vault, &imported.blob_id))?;
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        // A shared borrow, so the `move` closure captures the reference and
+        // both threads drive the same vault instance.
+        let shared = &vault;
+        let refused = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                // Armed on the writer's own thread: the seam is thread-local,
+                // so it releases this mutator and nothing else.
+                crate::vault::ADMISSION_RENDEZVOUS.with(|slot| slot.set(Some(writer_barrier)));
+                match mutator {
+                    "commit_import" => staged
+                        .ok_or_else(|| AppError::new(ErrorCode::Internal))
+                        .and_then(|staged| shared.commit_import(staged))
+                        .map(|_| ()),
+                    "claim_job" => shared.claim_job(NOW, 60).map(|_| ()),
+                    _ => lease
+                        .ok_or_else(|| AppError::new(ErrorCode::Internal))
+                        .and_then(|lease| shared.complete_job(&lease, NOW)),
+                }
+            });
+
+            // The discovering thread holds the database guard, releases the
+            // writer from inside it, then latches repair state and only then
+            // lets go.
+            let mut sink = RendezvousSink {
+                barrier: Arc::clone(&barrier),
+                signalled: false,
+            };
+            let discovered = shared.recover(&imported.blob_id, &mut sink);
+            let joined = writer.join();
+            (discovered, joined)
+        });
+
+        assert_eq!(
+            refused
+                .0
+                .err()
+                .ok_or("missing canonical original accepted")?
+                .code,
+            ErrorCode::MissingBlob,
+            "{mutator}"
+        );
+        assert_eq!(
+            vault.health(),
+            ReconciliationHealth::RepairRequired,
+            "{mutator}"
+        );
+
+        // The writer's admission was decided strictly after that latch became
+        // visible, so it must refuse.
+        let refused = refused
+            .1
+            .map_err(|_| "writer thread panicked")?
+            .err()
+            .ok_or(format!("{mutator} admitted after integrity discovery"))?;
+        assert_eq!(refused.code, ErrorCode::MissingBlob, "{mutator}");
+
+        // Nothing the blocked writer would have written may exist.
+        assert_eq!(
+            (
+                count(&vault, "blobs")?,
+                count(&vault, "items")?,
+                count(&vault, "item_blobs")?,
+                count(&vault, "jobs")?,
+            ),
+            before,
+            "{mutator} committed canonical rows"
+        );
+        assert_eq!(
+            status(&vault, &job_id)?,
+            job_before,
+            "{mutator} moved job state"
+        );
+        let verified_after: Option<String> = vault.db()?.query_row(
+            "SELECT verified_at FROM blobs WHERE id=?1",
+            [&watched_blob],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            verified_after, verified_before,
+            "{mutator} published a result"
+        );
+        if let Some(path) = staging_path {
+            // The encrypted candidate survives as reconcilable temporary state:
+            // recoverable, unlike a false canonical success.
+            assert!(path.is_file(), "refused staging was destroyed");
+        }
+        assert_eq!(
+            vault.health(),
+            ReconciliationHealth::RepairRequired,
+            "{mutator}"
+        );
+    }
+    Ok(())
+}
+
+/// T1 — CASE A: the opposite order is legal. A writer that linearizes before
+/// discovery commits normally; the later discovery still latches, and the next
+/// mutation is refused.
+#[test]
+fn writer_that_linearizes_first_commits_and_later_discovery_still_closes() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let imported = dvm_application::storage::import(&vault, &fixture.source(&[4, 2, 7])?)?;
+    let second = fixture.root.join("second import.bin");
+    fs::write(&second, [1, 1, 2])?;
+    let staged = vault.stage_import(&second)?;
+
+    // The writer takes the admission guard first and runs to completion.
+    let committed = std::thread::scope(|scope| scope.spawn(|| vault.commit_import(staged)).join())
+        .map_err(|_| "writer thread panicked")??;
+    assert_eq!(count(&vault, "blobs")?, 2);
+    assert_eq!(count(&vault, "items")?, 2);
+    assert_eq!(vault.health(), ReconciliationHealth::Healthy);
+
+    // Corruption discovered afterwards still latches, exactly as before.
+    fs::remove_file(canonical(&vault, &imported.blob_id))?;
+    let mut sink = BytesSink::default();
+    assert_eq!(
+        vault
+            .recover(&imported.blob_id, &mut sink)
+            .err()
+            .ok_or("missing canonical original accepted")?
+            .code,
+        ErrorCode::MissingBlob
+    );
+    assert_eq!(vault.health(), ReconciliationHealth::RepairRequired);
+
+    // The commit that linearized first stays committed; the next one is refused.
+    let survived: String = vault.db()?.query_row(
+        "SELECT status FROM items WHERE id=?1",
+        [&committed.item_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(survived, "IMPORTED");
+    let third = fixture.root.join("third import.bin");
+    fs::write(&third, [3, 3, 3])?;
+    assert_eq!(
+        dvm_application::storage::import(&vault, &third)
+            .err()
+            .ok_or("import admitted after integrity discovery")?
+            .code,
+        ErrorCode::MissingBlob
+    );
+    assert_eq!(count(&vault, "blobs")?, 2);
+    assert_eq!(count(&vault, "items")?, 2);
+    Ok(())
+}
+
+/// T2 storage oracle: an operational read failure over an intact canonical
+/// original must leave the item, the vault health and write admission alone.
+#[test]
+fn operational_canonical_read_failure_never_condemns_intact_data() -> TestResult {
+    // One offset per DVB1 read phase, all strictly after a successful open.
+    for (phase, offset) in [
+        ("header", 10),
+        ("header authentication tag", 56),
+        ("frame index/length", 72),
+        ("encrypted frame payload", 84),
+        ("trailing byte", 99),
+    ] {
+        let fixture = Fixture::new()?;
+        let vault = fixture.create()?;
+        let imported = dvm_application::storage::import(&vault, &fixture.source(&[5, 5, 9])?)?;
+        let stored = canonical(&vault, &imported.blob_id);
+        assert!(stored.is_file());
+        assert_eq!(
+            fs::metadata(&stored)?.len(),
+            99,
+            "{phase}: unexpected layout"
+        );
+
+        crate::vault::READ_FAULT.with(|fault| {
+            fault.set(Some((offset, std::io::ErrorKind::PermissionDenied)));
+        });
+        let mut blocked = BytesSink::default();
+        let operational = vault
+            .recover(&imported.blob_id, &mut blocked)
+            .err()
+            .ok_or(format!("{phase}: operational read failure accepted"))?;
+        assert_eq!(operational.code, ErrorCode::Internal, "{phase}");
+        assert_ne!(operational.code, ErrorCode::BlobAuthFailed, "{phase}");
+        assert_ne!(operational.code, ErrorCode::MissingBlob, "{phase}");
+        assert!(
+            blocked.aborted && blocked.committed.is_empty() && blocked.staged.is_empty(),
+            "{phase}: partial plaintext survived"
+        );
+
+        // Item status unchanged, health unchanged, admission unchanged.
+        let untouched: String = vault.db()?.query_row(
+            "SELECT status FROM items WHERE id=?1",
+            [&imported.item_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(untouched, "IMPORTED", "{phase}");
+        assert_eq!(vault.health(), ReconciliationHealth::Healthy, "{phase}");
+        let next = fixture.root.join("after operational failure.bin");
+        fs::write(&next, [7, 7, 7])?;
+        dvm_application::storage::import(&vault, &next)?;
+
+        // Transient means transient: the same original still recovers whole.
+        let mut restored = BytesSink::default();
+        vault.recover(&imported.blob_id, &mut restored)?;
+        assert_eq!(restored.committed, vec![5, 5, 9], "{phase}");
+
+        // Control: a real authentication failure at the same phase still
+        // condemns the item and closes write admission.
+        let mut bytes = fs::read(&stored)?;
+        let target = if offset >= bytes.len() {
+            bytes.len() - 1
+        } else {
+            offset
+        };
+        bytes[target] ^= 1;
+        fs::write(&stored, bytes)?;
+        let mut condemned_sink = BytesSink::default();
+        let authentication = vault
+            .recover(&imported.blob_id, &mut condemned_sink)
+            .err()
+            .ok_or(format!("{phase}: canonical corruption accepted"))?;
+        assert_eq!(authentication.code, ErrorCode::BlobAuthFailed, "{phase}");
+        let condemned: String = vault.db()?.query_row(
+            "SELECT status FROM items WHERE id=?1",
+            [&imported.item_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(condemned, "CORRUPTED", "{phase}");
+        assert_eq!(
+            vault.health(),
+            ReconciliationHealth::RepairRequired,
+            "{phase}"
+        );
+        let last = fixture.root.join("after authentication failure.bin");
+        fs::write(&last, [8, 8, 8])?;
+        assert_eq!(
+            dvm_application::storage::import(&vault, &last)
+                .err()
+                .ok_or(format!("{phase}: import admitted after corruption"))?
+                .code,
+            ErrorCode::MissingBlob,
+            "{phase}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn verified_at_uses_one_canonical_utc_representation_for_every_writer() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let imported = dvm_application::storage::import(&vault, &fixture.source(&[8, 0, 4])?)?;
+    let at_import: String = vault.db()?.query_row(
+        "SELECT verified_at FROM blobs WHERE id=?1",
+        [&imported.blob_id],
+        |row| row.get(0),
+    )?;
+
+    // The verification job is the second writer of the same column.
+    let lease = vault.claim_job(NOW, 60)?.ok_or("no verification job")?;
+    vault.complete_job(&lease, NOW)?;
+    let at_verification: String = vault.db()?.query_row(
+        "SELECT verified_at FROM blobs WHERE id=?1",
+        [&imported.blob_id],
+        |row| row.get(0),
+    )?;
+
+    // One grammar for both writers, not one per code path.
+    assert!(is_canonical_utc_iso(&at_import), "import: {at_import}");
+    assert!(
+        is_canonical_utc_iso(&at_verification),
+        "verification: {at_verification}"
+    );
+    assert_eq!(at_import.len(), at_verification.len());
+    assert_ne!(at_import, at_verification);
+
+    // The job writer encodes exactly its injected `now`, decoded by an
+    // independent SQLite function rather than the one that wrote it.
+    let decoded: i64 =
+        vault
+            .db()?
+            .query_row("SELECT unixepoch(?1)", [&at_verification], |row| row.get(0))?;
+    assert_eq!(decoded, i64::try_from(NOW)?);
+
+    // Fixed-width UTC text means plain text ordering is chronological ordering.
+    // A padded Unix-seconds job writer sorts before every ISO import value and
+    // would fail here.
+    assert!(
+        at_verification > at_import,
+        "text ordering is not chronological: {at_import} then {at_verification}"
+    );
+
+    // Job scheduling columns keep their own sortable fixed-width convention.
+    let (available_at, updated_at): (String, String) = vault.db()?.query_row(
+        "SELECT available_at,updated_at FROM jobs WHERE id=?1",
+        [&lease.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(available_at.len(), 20);
+    assert!(available_at.bytes().all(|byte| byte.is_ascii_digit()));
+    assert_eq!(updated_at, crate::jobs::timestamp(NOW)?);
+    assert!(!is_canonical_utc_iso(&updated_at));
+    Ok(())
+}
+
+#[test]
+fn reconciliation_orphan_membership_is_constant_time_and_semantics_preserving() -> TestResult {
+    use std::collections::HashSet;
+
+    // Membership is a prebuilt set, so each directory entry costs one average
+    // O(1) lookup. A linear rescan of every row per file would need ~2.5e9
+    // comparisons for these inputs instead of ~1e5.
+    let ids: Vec<String> = (0..50_000)
+        .map(|index| Uuid::from_u128(index).to_string())
+        .collect();
+    let known: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    assert_eq!(known.len(), ids.len());
+    for id in &ids {
+        assert!(crate::vault::referenced(
+            &known,
+            std::ffi::OsStr::new(&format!("{id}.dvb"))
+        ));
+        // Unknown id, missing suffix and foreign suffix are all unreferenced.
+        assert!(!crate::vault::referenced(
+            &known,
+            std::ffi::OsStr::new(&format!("{id}.tmp"))
+        ));
+        assert!(!crate::vault::referenced(&known, std::ffi::OsStr::new(id)));
+    }
+    assert!(!crate::vault::referenced(
+        &known,
+        std::ffi::OsStr::new(&format!("{}.dvb", Uuid::from_u128(50_001)))
+    ));
+    assert!(!crate::vault::referenced(
+        &known,
+        std::ffi::OsStr::new(".dvb")
+    ));
+
+    // Unchanged reconciliation semantics on a real vault: referenced blobs are
+    // preserved and recoverable, every unreferenced file is quarantined.
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let first = dvm_application::storage::import(&vault, &fixture.source(&[2, 4, 6])?)?;
+    let second = dvm_application::storage::import(&vault, &fixture.source(&[1, 3, 5])?)?;
+    let blobs = vault.root.join("blobs");
+    let orphans = [
+        format!("{}.dvb", Uuid::from_u128(7)),
+        "not-a-uuid.dvb".to_owned(),
+        "stray-without-suffix".to_owned(),
+        format!("{}.dvb.bak", first.blob_id),
+    ];
+    for name in &orphans {
+        fs::write(blobs.join(name), b"unreferenced")?;
+    }
+    drop(vault);
+
+    let reopened = fixture.reopen()?;
+    assert_eq!(reopened.reconciliation.quarantined_orphans, orphans.len());
+    assert_eq!(
+        fs::read_dir(reopened.root.join("quarantine"))?.count(),
+        orphans.len()
+    );
+    assert_eq!(
+        fs::read_dir(reopened.root.join("blobs"))?.count(),
+        2,
+        "a referenced canonical blob was quarantined"
+    );
+    for receipt in [&first, &second] {
+        assert!(canonical(&reopened, &receipt.blob_id).is_file());
+    }
+    // Quarantining orphans is a repair condition, and the referenced originals
+    // are still byte-exact.
+    assert_eq!(
+        reopened.reconciliation.health,
+        ReconciliationHealth::RepairRequired
+    );
+    assert_eq!(reopened.reconciliation.missing_blobs, 0);
+    let mut sink = BytesSink::default();
+    reopened.recover(&second.blob_id, &mut sink)?;
+    assert_eq!(sink.committed, vec![1, 3, 5]);
+    Ok(())
+}

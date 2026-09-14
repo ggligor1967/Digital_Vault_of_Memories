@@ -2,14 +2,14 @@
 
 A local-first desktop application for importing, preserving, organising, searching and exporting personal digital memories — photographs, videos, audio, documents and text — with the original bytes treated as more important than anything derived from them.
 
-**Status: gate G0 — repository foundation. This is not yet a usable product.**
+**Status: G0 closed; G1 — zero-loss vault storage is current. This is not yet a usable product.**
 
-The application currently starts, shows the version of its renderer and of its trusted Rust backend, and confirms that the two agree on the IPC contract. There is no vault, no encryption, no storage, no search and no AI. Those arrive gate by gate, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36, and none of them may be started before the gate they belong to is authorised.
+The application currently starts, shows the version of its renderer and of its trusted Rust backend, and confirms that the two agree on the IPC contract. G1 adds trusted Rust storage APIs and injected-key integration tests. There is no production vault creation/unlock, passphrase/recovery/device key lifecycle, search or AI. Those arrive gate by gate, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36, and none of them may be started before the gate they belong to is authorised.
 
 | Gate   | Scope                                                                                     | State       |
 | ------ | ----------------------------------------------------------------------------------------- | ----------- |
-| **G0** | Repository foundation: workspace, lockfiles, Tauri 2 shell, typed IPC, error envelope, CI | **current** |
-| G1     | Zero-loss vault storage                                                                   | not started |
+| **G0** | Repository foundation: workspace, lockfiles, Tauri 2 shell, typed IPC, error envelope, CI | **closed**  |
+| **G1** | Zero-loss vault storage                                                                   | **current** |
 | G2     | Security and key lifecycle                                                                | not started |
 | G3     | Recovery, backup, migration                                                               | not started |
 | G4     | Deterministic search                                                                      | not started |
@@ -153,7 +153,9 @@ apps/desktop/            Tauri 2 shell (src-tauri/) and React renderer (src/)
 crates/dvm-domain/       Contracts: error envelope, foundation status, TS generator
 crates/dvm-application/  Use cases behind typed ports
 crates/dvm-observability/Sanitised structured diagnostics
-crates/dvm-{crypto,storage,search,ai,media,backup}/
+crates/dvm-crypto/       Storage keys and authenticated DVB1 streaming
+crates/dvm-storage/      SQLCipher, imports, durable jobs and reconciliation
+crates/dvm-{search,ai,media,backup}/
                          Reserved workspace members; no implementation before their gate
 packages/contracts/      Generated TypeScript mirror of the Rust contract
 packages/test-fixtures/  Deterministic fixtures and fake ports
@@ -176,3 +178,36 @@ scripts/                 Verification and evidence tooling
 ## Licence
 
 Not yet chosen. See [`SECURITY.md`](SECURITY.md).
+
+## G1 development and acceptance
+
+G1 implements SQLCipher metadata, authenticated DVB1 originals, streaming import,
+canonical dedup, durable verification jobs, and startup reconciliation through
+trusted Rust APIs. The UI remains the G0 status shell. Injected test VMKs are
+never persisted; an internal test vault with empty keyslots is not a production
+vault. G2 remains NOT STARTED.
+
+Windows builds require native Strawberry Perl (verified here: 5.42.3.1), in PATH,
+for bundled OpenSSL. Git's MSYS Perl is not the native MSVC build prerequisite.
+The SQLCipher/OpenSSL sources come from Cargo.lock; no installed SQLCipher is used.
+
+```powershell
+cargo test --locked -p dvm-crypto
+cargo test --locked -p dvm-storage -- --nocapture
+pnpm verify:g1
+pnpm verify:g1 --ci
+```
+
+The default G1 command includes G0 foundation regression/build/runtime, storage
+and real-process crash tests, and the mandatory >2 GiB import/recovery gate.
+The CI mode explicitly skips desktop runtime and the multi-GB gate with
+SKIPPED / NOT VERIFIED BY CI. It is not complete local acceptance.
+
+Use a short clean-room path such as C:\dvm-g1-cleanroom, install with
+`pnpm install --frozen-lockfile`, then run `pnpm verify:g1 --cleanroom` with the
+same native build prerequisites. Never copy target, node_modules or vault
+fixtures. Check free disk before builds and large fixtures; the test preserves
+a shutdown margin and removes only its own generated fixtures.
+
+See ADR-0002 through ADR-0005 and
+[the G1 evidence record](docs/release-evidence/G1-ZERO-LOSS-VAULT-STORAGE.md).

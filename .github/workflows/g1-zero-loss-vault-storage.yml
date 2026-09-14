@@ -1,0 +1,35 @@
+name: G1 — Zero-Loss Vault Storage
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: g1-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    name: Verify G1 (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.94.1'
+          components: rustfmt, clippy
+      - name: Native Perl prerequisite for bundled OpenSSL
+        shell: pwsh
+        run: |
+          if (-not (Test-Path C:\Strawberry\perl\bin\perl.exe)) { throw 'Native Strawberry Perl is required' }
+          'C:\Strawberry\perl\bin' >> $env:GITHUB_PATH
+          & C:\Strawberry\perl\bin\perl.exe -v
+      - name: Single-source G1 CI gate
+        run: pnpm verify:g1 --ci

@@ -119,13 +119,63 @@ jobs:
           fi
           echo "Node and Rust match the pinned versions."
 
+      - name: Native Perl for G1 bundled OpenSSL foundation regression
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # The runner image already ships native Strawberry Perl, so nothing is
+        # installed here: the only job is to put it ahead of any other Perl for
+        # every later process.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath 'C:\Strawberry\perl\bin\perl.exe')) {
+            throw 'Native Strawberry Perl is required at C:\Strawberry\perl\bin\perl.exe'
+          }
+          'C:\Strawberry\perl\bin' >> $env:GITHUB_PATH
+
+      # The gate implementation is `scripts/verify-g0.mjs` on every platform;
+      # only the surrounding shell differs, because the shell decides which
+      # Perl the vendored OpenSSL build inherits.
+      #
+      # Git Bash prepends its own MSYS `/usr/bin` ahead of anything added to
+      # GITHUB_PATH, so `perl` resolved to the MSYS interpreter, which has no
+      # `Locale::Maketext::Simple`, and `openssl-src` failed its `./Configure`
+      # during `cargo clippy`. PowerShell honours native Windows PATH order, so
+      # the Strawberry Perl prepended above wins for this process and for the
+      # `cmd.exe`/Cargo/OpenSSL children that inherit its environment. This
+      # matches the G1 workflow, whose gate step already runs under pwsh.
+      - name: Run the G0 gate (Windows native toolchain)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = 'C:\Strawberry\perl\bin\perl.exe'
+          # Get-Command returns every match in PATH order; index 0 is the one a
+          # child process actually executes. Taking .Source off the whole
+          # collection would yield an array and break the comparison below.
+          $selected = @(Get-Command perl -CommandType Application)[0].Source
+          Write-Host "selected perl: $selected"
+          if ($selected -ne $expected) {
+            throw "Expected native Perl at $expected but this process selected $selected"
+          }
+          perl --version
+          if ($LASTEXITCODE -ne 0) { throw 'Native Perl did not report a version' }
+          perl -MLocale::Maketext::Simple -e 'print "Locale::Maketext::Simple probe PASS\n"'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Locale::Maketext::Simple is not loadable by the selected Perl'
+          }
+          # `--no-runtime` because a GitHub runner has no interactive desktop
+          # session in which to open a window. The runtime IPC evidence is
+          # therefore captured locally and recorded in
+          # docs/release-evidence/G0-REPOSITORY-FOUNDATION.md; the script reports
+          # the step as SKIPPED rather than letting it look like it passed.
+          node scripts/verify-g0.mjs --no-runtime
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run the G0 gate
+        if: runner.os != 'Windows'
         shell: bash
-        # `--no-runtime` because a GitHub runner has no interactive desktop
-        # session in which to open a window. The runtime IPC evidence is
-        # therefore captured locally and recorded in
-        # docs/release-evidence/G0-REPOSITORY-FOUNDATION.md; the script reports
-        # the step as SKIPPED rather than letting it look like it passed.
+        # Same single-sourced implementation; Linux needs no Perl selection
+        # because its native toolchain already satisfies the vendored build.
         run: node scripts/verify-g0.mjs --no-runtime
 
       - name: Upload the renderer bundle

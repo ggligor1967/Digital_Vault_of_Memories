@@ -12,3 +12,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+dvm-domain.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

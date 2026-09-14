@@ -86,6 +86,37 @@ impl FoundationService {
     }
 }
 
+/// Trusted storage use cases; infrastructure implements the domain ports.
+pub mod storage {
+    use dvm_domain::{
+        AppError,
+        storage::{ImportReceipt, ImportRepository, JobRepository},
+    };
+    use std::path::Path;
+
+    /// Preserves the source before acknowledging a committed import.
+    /// # Errors
+    /// Propagates every staging and commit failure without reporting success.
+    pub fn import(
+        repository: &impl ImportRepository,
+        source: &Path,
+    ) -> Result<ImportReceipt, AppError> {
+        let staged = repository.stage_import(source)?;
+        repository.commit_import(staged)
+    }
+
+    /// Runs one durable verification job, acknowledging only its committed result.
+    /// # Errors
+    /// Propagates claim/work errors; failed work stays unacknowledged.
+    pub fn run_one_job(repository: &impl JobRepository, now: u64) -> Result<bool, AppError> {
+        let Some(lease) = repository.claim_job(now, 60)? else {
+            return Ok(false);
+        };
+        repository.complete_job(&lease, now)?;
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FOUNDATION_STATUS_SERVED_EVENT, FoundationService};

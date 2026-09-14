@@ -14,6 +14,7 @@
  * at the end is the record that goes into the gate evidence file.
  */
 import { spawnSync } from 'node:child_process';
+import { statfsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -185,6 +186,8 @@ for (const step of STEPS) {
   console.log(`\n─── RUN   ${step.id}: ${step.description}`);
   console.log(`         $ ${renderCommand(step)}`);
 
+  const disk = statfsSync(REPO_ROOT);
+  console.log(`         free disk before ${step.id}: ${disk.bavail * disk.bsize} bytes`);
   const started = Date.now();
   const outcome = spawnSync(step.command, step.args, {
     cwd: REPO_ROOT,
