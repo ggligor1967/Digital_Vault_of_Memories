@@ -28,7 +28,7 @@ pub struct VaultHeader {
     /// Future G2 container format, not a wrapping implementation.
     pub keyslot_format_version: u32,
     /// Reserved, always empty at the G1 internal test boundary.
-    pub keyslots: Vec<String>,
+    pub keyslots: Vec<crate::security::Keyslot>,
 }
 
 /// A staged encrypted import awaiting canonical commit. Trusted-only metadata.

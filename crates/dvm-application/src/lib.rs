@@ -21,6 +21,9 @@
 use dvm_domain::{API_CONTRACT_VERSION, FoundationHealth, FoundationStatus};
 use dvm_observability::DiagnosticEvent;
 
+pub mod provider_secrets;
+pub mod session;
+
 /// Name of the diagnostic event emitted when the foundation status is served.
 ///
 /// The runtime-evidence procedure of the G0 execution prompt (§19) greps for

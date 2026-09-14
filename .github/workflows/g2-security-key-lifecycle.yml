@@ -1,0 +1,27 @@
+name: G2 Security and Key Lifecycle
+on:
+  push:
+    branches: [main, feat/dvm-v2-g2-security-key-lifecycle]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  security:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.27.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - name: Repository-owned G2 gate
+        shell: pwsh
+        run: pnpm verify:g2 --ci

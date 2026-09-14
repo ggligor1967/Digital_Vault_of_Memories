@@ -230,17 +230,22 @@ impl AppError {
 
     /// Attaches sanitised detail.
     ///
-    /// [`AppError::sanitise`] is applied unconditionally as defence in depth,
-    /// so that an accidental path, URL or oversized internal message cannot
-    /// reach the renderer even when a caller passes one.
+    /// Only a fixed public operational message survives. Every other input
+    /// becomes a redacted marker, including private path components and secrets.
     #[must_use]
     pub fn with_safe_details(mut self, details: impl AsRef<str>) -> Self {
-        self.safe_details = Self::sanitise(details.as_ref());
+        self.safe_details = Some(
+            match details.as_ref() {
+                "diagnostics sink unavailable" => "diagnostics sink unavailable",
+                _ => "redacted",
+            }
+            .to_owned(),
+        );
         self
     }
 
-    /// Reduces arbitrary text to a renderer-safe detail string, or `None` when
-    /// nothing safe remains.
+    /// Legacy structural normalization for non-secret text. This is not secret
+    /// redaction and is not used to construct IPC details.
     ///
     /// The filter is deliberately allow-list based rather than an attempt to
     /// enumerate what a secret looks like: only ASCII letters, digits, spaces
@@ -451,7 +456,7 @@ mod tests {
             .with_safe_details(r"failed to read C:\Users\someone\photo.jpg");
 
         let details = error.safe_details.expect("some text should survive");
-        assert!(details.starts_with("failed to read"));
+        assert_eq!(details, "redacted");
         assert!(!details.contains('\\'));
         assert!(!details.contains(':'));
     }

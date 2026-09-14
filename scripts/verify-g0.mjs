@@ -32,6 +32,13 @@ const listOnly = argv.includes('--list');
  */
 const STEPS = [
   {
+    id: 'native-sodium',
+    group: 'Reproducibility',
+    description: 'verify pinned G2 libsodium native build input',
+    command: 'node',
+    args: ['scripts/prepare-sodium.mjs'],
+  },
+  {
     id: 'install',
     group: 'Reproducibility',
     description: 'frozen-lockfile install',

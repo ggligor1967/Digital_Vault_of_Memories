@@ -27,10 +27,8 @@ const LATER_GATE_DEPENDENCIES: { fragment: string; gate: string }[] = [
   { fragment: 'better-sqlite3', gate: 'G1' },
   { fragment: 'tauri-plugin-sql', gate: 'G1' },
   // G2 — cryptography and secret storage
-  { fragment: 'argon2', gate: 'G2' },
   { fragment: 'aes-gcm', gate: 'G2' },
   { fragment: 'ring', gate: 'G2' },
-  { fragment: 'keyring', gate: 'G2' },
   { fragment: 'tauri-plugin-stronghold', gate: 'G2' },
   // G3 — backup
   { fragment: 'zip', gate: 'G3' },
@@ -105,10 +103,12 @@ function cargoDependencyNames(): { manifest: string; name: string }[] {
       const line = rawLine.trim();
 
       if (line.startsWith('[')) {
-        inDependencySection = /^\[(workspace\.)?(build-|dev-)?dependencies\]$/.test(line);
-        const tableMatch = /^\[(workspace\.)?(build-|dev-)?dependencies\.([A-Za-z0-9_-]+)\]$/.exec(
-          line,
-        );
+        inDependencySection =
+          /^\[(?:target\..+\.)?(workspace\.)?(build-|dev-)?dependencies\]$/.test(line);
+        const tableMatch =
+          /^\[(?:target\..+\.)?(workspace\.)?(build-|dev-)?dependencies\.([A-Za-z0-9_-]+)\]$/.exec(
+            line,
+          );
         if (tableMatch?.[3]) {
           found.push({ manifest, name: tableMatch[3] });
         }
@@ -151,7 +151,7 @@ describe('dependency scope', () => {
     for (const { manifest, name } of allDependencies) {
       for (const { fragment, gate } of LATER_GATE_DEPENDENCIES) {
         if (matchesFragment(name, fragment)) {
-          violations.push(`${manifest}: "${name}" is ${gate} scope, but G1 is the current gate`);
+          violations.push(`${manifest}: "${name}" is ${gate} scope, but G2 is the current gate`);
         }
       }
     }
@@ -220,8 +220,6 @@ describe('reserved crates', () => {
 describe('G1 storage boundary', () => {
   it('keeps future-gate detection active for representative prohibited dependencies', () => {
     for (const name of [
-      'argon2',
-      'keyring',
       'hnsw',
       'tantivy',
       'openai',

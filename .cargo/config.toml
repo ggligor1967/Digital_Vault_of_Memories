@@ -1,0 +1,4 @@
+# Repository-owned, hash-verified static library prepared by scripts/prepare-sodium.mjs.
+# A missing input fails linking; the binding must never download a moving fallback.
+[env]
+SODIUM_LIB_DIR = { value = ".dvm-local/native/libsodium-1.0.22/lib", relative = true, force = true }

@@ -30,6 +30,9 @@ hkdf = "=0.13.0"
 sha2 = "=0.11.0"
 getrandom = "=0.4.3"
 zeroize = "=1.9.0"
+libsodium-sys-stable = { version = "=1.24.0", default-features = false }
+keyring-core = "=1.0.0"
+windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
