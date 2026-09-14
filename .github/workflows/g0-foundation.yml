@@ -149,7 +149,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $expected = 'C:\Strawberry\perl\bin\perl.exe'
-          $selected = (Get-Command perl -CommandType Application).Source
+          # Get-Command returns every match in PATH order; index 0 is the one a
+          # child process actually executes. Taking .Source off the whole
+          # collection would yield an array and break the comparison below.
+          $selected = @(Get-Command perl -CommandType Application)[0].Source
           Write-Host "selected perl: $selected"
           if ($selected -ne $expected) {
             throw "Expected native Perl at $expected but this process selected $selected"
