@@ -44,6 +44,22 @@ pub trait PlaintextSink {
 fn corrupt() -> AppError {
     AppError::new(ErrorCode::BlobAuthFailed)
 }
+/// Classifies a failure to read the stored DVB1 stream.
+///
+/// Truncation is a content failure: bytes the format requires are absent, so
+/// the stream cannot authenticate and `BLOB_AUTH_FAILED` is the truthful
+/// verdict. Every other read failure is operational — failing or disconnected
+/// storage, a permission change, a transient fault — and says nothing about
+/// the stored ciphertext, which may be entirely intact. Reporting those as an
+/// authentication failure makes the caller condemn healthy canonical data, so
+/// they keep an operational code and never accuse the bytes.
+fn read_error(error: &std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        corrupt()
+    } else {
+        AppError::new(ErrorCode::Internal)
+    }
+}
 fn output_error(error: &std::io::Error) -> AppError {
     AppError::new(if error.kind() == std::io::ErrorKind::StorageFull {
         ErrorCode::DiskFull
@@ -175,7 +191,9 @@ fn decrypt_frames(
     sink: &mut impl PlaintextSink,
 ) -> Result<DigestReceipt, AppError> {
     let mut header = [0; HEADER_SIZE];
-    source.read_exact(&mut header).map_err(|_| corrupt())?;
+    source
+        .read_exact(&mut header)
+        .map_err(|error| read_error(&error))?;
     if &header[..4] != b"DVB1"
         || header[4..6] != 1_u16.to_le_bytes()
         || header[6..8] != 1_u16.to_le_bytes()
@@ -187,7 +205,9 @@ fn decrypt_frames(
     let size = u64::from_le_bytes(header[28..36].try_into().map_err(|_| corrupt())?);
     let cipher = XChaCha20Poly1305::new_from_slice(key.0.as_ref()).map_err(|_| corrupt())?;
     let mut tag = [0; 16];
-    source.read_exact(&mut tag).map_err(|_| corrupt())?;
+    source
+        .read_exact(&mut tag)
+        .map_err(|error| read_error(&error))?;
     cipher
         .decrypt(
             &nonce(&header, 0),
@@ -206,7 +226,7 @@ fn decrypt_frames(
         aad[..HEADER_SIZE].copy_from_slice(&header);
         source
             .read_exact(&mut aad[HEADER_SIZE..])
-            .map_err(|_| corrupt())?;
+            .map_err(|error| read_error(&error))?;
         let length = usize::try_from(remaining.min(CHUNK_SIZE as u64)).map_err(|_| corrupt())?;
         if aad[HEADER_SIZE..HEADER_SIZE + 8] != index.to_le_bytes()
             || aad[HEADER_SIZE + 8..] != u32::try_from(length).map_err(|_| corrupt())?.to_le_bytes()
@@ -215,7 +235,7 @@ fn decrypt_frames(
         }
         source
             .read_exact(&mut encrypted[..length + 16])
-            .map_err(|_| corrupt())?;
+            .map_err(|error| read_error(&error))?;
         let plain = Zeroizing::new(
             cipher
                 .decrypt(
@@ -233,7 +253,11 @@ fn decrypt_frames(
         index += 1;
     }
     let mut extra = [0];
-    if source.read(&mut extra).map_err(|_| corrupt())? != 0 {
+    if source
+        .read(&mut extra)
+        .map_err(|error| read_error(&error))?
+        != 0
+    {
         return Err(corrupt());
     }
     Ok(receipt(hash, size))
@@ -294,6 +318,56 @@ mod tests {
         encrypt(&mut &*bytes, &mut output, &key(id)?, id, bytes.len() as u64)?;
         Ok(output)
     }
+    /// A deterministic reader that serves valid bytes up to `fail_at` and then
+    /// fails with a chosen kind.
+    ///
+    /// Operational read failures must be provable at an exact DVB1 phase
+    /// without damaging real storage or depending on a platform's filesystem
+    /// behaviour, so the failure is injected in the reader rather than in the
+    /// bytes.
+    struct FaultyReader<'a> {
+        bytes: &'a [u8],
+        position: usize,
+        fail_at: usize,
+        kind: std::io::ErrorKind,
+    }
+    impl<'a> FaultyReader<'a> {
+        fn new(bytes: &'a [u8], fail_at: usize, kind: std::io::ErrorKind) -> Self {
+            Self {
+                bytes,
+                position: 0,
+                fail_at,
+                kind,
+            }
+        }
+    }
+    impl Read for FaultyReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.position >= self.fail_at {
+                return Err(std::io::Error::from(self.kind));
+            }
+            let available = (self.fail_at - self.position)
+                .min(self.bytes.len() - self.position)
+                .min(buffer.len());
+            buffer[..available]
+                .copy_from_slice(&self.bytes[self.position..self.position + available]);
+            self.position += available;
+            Ok(available)
+        }
+    }
+
+    /// Every DVB1 read phase, named by the byte offset at which that phase's
+    /// first byte is consumed from the stored stream.
+    fn read_phases(length: usize) -> [(&'static str, usize); 5] {
+        [
+            ("header", 10),
+            ("header authentication tag", HEADER_SIZE + 4),
+            ("frame index/length", HEADER_SIZE + 16 + 4),
+            ("encrypted frame payload", HEADER_SIZE + 16 + 12 + 4),
+            ("trailing byte", length),
+        ]
+    }
+
     fn reject(bytes: &[u8], id: &[u8; 16]) -> Result<(), Box<dyn std::error::Error>> {
         let mut sink = Sink::default();
         let error = decrypt(&mut &*bytes, &key(id)?, id, None, &mut sink)
@@ -409,6 +483,93 @@ mod tests {
         assert!(sink.committed.is_empty());
         Ok(())
     }
+    /// T2: an operational read failure over an intact stored stream must never
+    /// be reported as an authentication failure, because the caller condemns
+    /// canonical data on that verdict.
+    #[test]
+    fn operational_read_failures_never_authenticate_as_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id = [1; 16];
+        let bytes = encoded(&[9; 3], &id)?;
+        for (phase, offset) in read_phases(bytes.len()) {
+            // `read_exact` retries `Interrupted` internally, so a reader that
+            // returned it forever would spin: it is exercised at the trailing
+            // single `read` phase, which has no retry loop.
+            let kinds: &[std::io::ErrorKind] = if phase == "trailing byte" {
+                &[
+                    std::io::ErrorKind::PermissionDenied,
+                    std::io::ErrorKind::Interrupted,
+                    std::io::ErrorKind::BrokenPipe,
+                    std::io::ErrorKind::TimedOut,
+                    std::io::ErrorKind::Other,
+                ]
+            } else {
+                &[
+                    std::io::ErrorKind::PermissionDenied,
+                    std::io::ErrorKind::BrokenPipe,
+                    std::io::ErrorKind::TimedOut,
+                    std::io::ErrorKind::ConnectionAborted,
+                    std::io::ErrorKind::Other,
+                ]
+            };
+            for &kind in kinds {
+                let mut sink = Sink::default();
+                let mut reader = FaultyReader::new(&bytes, offset, kind);
+                let error = decrypt(&mut reader, &key(&id)?, &id, None, &mut sink)
+                    .err()
+                    .ok_or(format!("{phase}: operational {kind:?} accepted"))?;
+                assert_eq!(
+                    error.code,
+                    ErrorCode::Internal,
+                    "{phase}: {kind:?} must stay operational"
+                );
+                assert_ne!(error.code, ErrorCode::BlobAuthFailed, "{phase}: {kind:?}");
+                assert_ne!(error.code, ErrorCode::MissingBlob, "{phase}: {kind:?}");
+                // Reclassifying the code must not weaken the transactional sink.
+                assert!(
+                    sink.aborted && sink.provisional.is_empty() && sink.committed.is_empty(),
+                    "{phase}: {kind:?} committed partial plaintext"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// T2 control: a genuinely truncated stored stream is a content failure and
+    /// must keep authenticating as corruption at every framing phase.
+    #[test]
+    fn truncation_still_authenticates_as_corruption() -> Result<(), Box<dyn std::error::Error>> {
+        let id = [1; 16];
+        let bytes = encoded(&[9; 3], &id)?;
+        for (phase, offset) in read_phases(bytes.len()) {
+            // An explicit UnexpectedEof from the reader.
+            let mut sink = Sink::default();
+            let mut reader = FaultyReader::new(&bytes, offset, std::io::ErrorKind::UnexpectedEof);
+            let error = decrypt(&mut reader, &key(&id)?, &id, None, &mut sink)
+                .err()
+                .ok_or(format!("{phase}: truncation accepted"))?;
+            assert_eq!(
+                error.code,
+                ErrorCode::BlobAuthFailed,
+                "{phase}: truncation must stay an authentication failure"
+            );
+            assert!(sink.aborted && sink.provisional.is_empty() && sink.committed.is_empty());
+            // And real truncation of the stored bytes, which reaches the same
+            // phase through the ordinary end-of-stream path.
+            if offset < bytes.len() {
+                reject(&bytes[..offset], &id)?;
+            }
+        }
+        // AEAD authentication failure and malformed framing are unchanged.
+        let mut flipped = bytes.clone();
+        flipped[HEADER_SIZE + 16 + 12] ^= 1;
+        reject(&flipped, &id)?;
+        let mut malformed = bytes.clone();
+        malformed[0] ^= 1;
+        reject(&malformed, &id)?;
+        Ok(())
+    }
+
     #[test]
     fn source_length_changes_never_succeed() -> Result<(), AppError> {
         for size in [0, 2] {

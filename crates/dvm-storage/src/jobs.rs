@@ -47,7 +47,6 @@ pub(crate) fn enqueue_verification(
 
 impl JobRepository for Vault {
     fn claim_job(&self, now: u64, lease_seconds: u64) -> Result<Option<JobLease>, AppError> {
-        self.require_writable()?;
         if !(1..=3600).contains(&lease_seconds) {
             return Err(AppError::new(ErrorCode::JobTerminal));
         }
@@ -56,7 +55,10 @@ impl JobRepository for Vault {
                 .ok_or_else(|| AppError::new(ErrorCode::Internal))?,
         )?;
         let now = timestamp(now)?;
-        let mut db = self.db()?;
+        // Admission is read under the same guard that carries the lease
+        // mutation, so a repair state latched by a concurrent integrity
+        // discovery can never be missed by a claim that was already waiting.
+        let mut db = self.writable_db()?;
         let tx = db.transaction().map_err(|error| db_error(&error))?;
         let row: Option<(String,String,u32)> = tx.query_row("SELECT id,payload_json,attempts FROM jobs WHERE status='PENDING' AND available_at<=?1 AND attempts<max_attempts ORDER BY priority,created_at,id LIMIT 1", [&now], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(|error| db_error(&error))?;
         let Some((id, payload, attempts)) = row else {
@@ -83,8 +85,9 @@ impl JobRepository for Vault {
     }
 
     fn complete_job(&self, lease: &JobLease, now: u64) -> Result<(), AppError> {
-        self.require_writable()?;
-        let mut db = self.db()?;
+        // Same boundary as `claim_job`: the guard admits the write and then
+        // carries the verification result commit.
+        let mut db = self.writable_db()?;
         let status = validate_lease(&db, lease, now)?;
         if status == "DONE" {
             return Ok(());

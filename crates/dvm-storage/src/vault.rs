@@ -79,6 +79,62 @@ fn open_canonical(path: &Path) -> std::io::Result<File> {
     File::open(path)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only canonical-read fault seam: serve a chosen number of valid
+    /// bytes from the canonical original, then fail the next read with a chosen
+    /// kind. One-shot, thread-local and absent from production builds, so the
+    /// operational-versus-authentication classification of canonical reads can
+    /// be proven against the real `Vault::recover` path without damaging real
+    /// storage and without creating any runtime fault-injection surface.
+    pub(crate) static READ_FAULT: std::cell::Cell<Option<(usize, std::io::ErrorKind)>> =
+        const { std::cell::Cell::new(None) };
+
+    /// Test-only write-admission rendezvous, armed by the deterministic race
+    /// regression. It runs immediately before a canonical mutator acquires its
+    /// admission guard, so an interleaving can be driven by a barrier instead
+    /// of by sleeps. Thread-local and absent from production builds.
+    pub(crate) static ADMISSION_RENDEZVOUS: std::cell::Cell<Option<std::sync::Arc<std::sync::Barrier>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The canonical original's reader.
+///
+/// In production this is a transparent pass-through to the open file. Test
+/// builds can additionally arm a one-shot read fault (see [`READ_FAULT`]);
+/// normal DVB1 and vault API semantics are identical either way.
+pub(crate) struct CanonicalRead {
+    file: File,
+    #[cfg(test)]
+    fault: Option<(usize, std::io::ErrorKind)>,
+}
+
+impl CanonicalRead {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            #[cfg(test)]
+            fault: READ_FAULT.with(std::cell::Cell::take),
+        }
+    }
+}
+
+impl Read for CanonicalRead {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if let Some((remaining, kind)) = self.fault {
+            if remaining == 0 {
+                return Err(std::io::Error::from(kind));
+            }
+            let limit = remaining.min(buffer.len());
+            let count = self.file.read(&mut buffer[..limit])?;
+            self.fault = Some((remaining - count, kind));
+            return Ok(count);
+        }
+        self.file.read(buffer)
+    }
+}
+
 /// Orphan classification for one `blobs/` directory entry.
 ///
 /// Takes a membership set built once by the caller: the directory scan must
@@ -268,6 +324,30 @@ impl Vault {
         Ok(())
     }
 
+    /// Acquires the canonical database mutex and admits the write only while
+    /// holding it. Every canonical mutator that requires a healthy vault must
+    /// take its guard from here.
+    ///
+    /// Write admission and integrity discovery have to be ordered by one
+    /// synchronization boundary. Reading health *before* taking this lock is a
+    /// TOCTOU: while the caller waits for the mutex, another caller can hold
+    /// it, discover a canonical integrity failure and latch `RepairRequired`;
+    /// the waiting caller then proceeds on a verdict it took before that
+    /// discovery and mutates a vault already known to be unusable. Reading the
+    /// live repair state under the same guard the mutation will use leaves
+    /// exactly two orders — mutation strictly before discovery, or refusal
+    /// strictly after it — and no third one in which a mutation follows a
+    /// discovery that already happened.
+    pub(crate) fn writable_db(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
+        #[cfg(test)]
+        if let Some(barrier) = ADMISSION_RENDEZVOUS.with(std::cell::Cell::take) {
+            barrier.wait();
+        }
+        let db = self.db()?;
+        self.require_writable()?;
+        Ok(db)
+    }
+
     /// Recovers an original through a transactional sink, bound to the encrypted DB identity.
     /// # Errors
     /// Missing/corrupt originals mark affected items CORRUPTED and never return success.
@@ -307,7 +387,8 @@ impl Vault {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(AppError::new(ErrorCode::BlobAuthFailed));
         }
-        let mut file = open_canonical(&path).map_err(|error| blob_io_error(&error))?;
+        let mut file =
+            CanonicalRead::new(open_canonical(&path).map_err(|error| blob_io_error(&error))?);
         let id = uuid_bytes(id)?;
         decrypt(
             &mut file,
@@ -409,6 +490,16 @@ fn healthy_report() -> ReconciliationReport {
 
 impl ImportRepository for Vault {
     fn stage_import(&self, source: &Path) -> Result<StagedImport, AppError> {
+        // Best-effort only, and deliberately not the authoritative admission:
+        // staging streams and encrypts the whole source, which for a multi-GB
+        // original runs for minutes. Holding the database mutex across that
+        // would serialize every unrelated database operation behind one import.
+        // Admission is therefore decided by `commit_import` under the database
+        // guard; this check merely avoids expensive staging that is already
+        // known to be pointless. If the repair state changes during staging,
+        // the commit refuses and the encrypted `.part` stays reconcilable
+        // temporary state — which is recoverable, whereas a false canonical
+        // success is not.
         self.require_writable()?;
         let source_meta =
             fs::symlink_metadata(source).map_err(|_| AppError::new(ErrorCode::SourceUnreadable))?;
@@ -486,8 +577,9 @@ impl ImportRepository for Vault {
     }
 
     fn commit_import(&self, staged: StagedImport) -> Result<ImportReceipt, AppError> {
-        self.require_writable()?;
-        let mut db = self.db()?;
+        // Authoritative write admission: taken under the database guard, and
+        // held across every canonical mutation below.
+        let mut db = self.writable_db()?;
         let candidate_id = Uuid::from_bytes(staged.blob_id).to_string();
         if staged.staging_path != self.root.join("tmp").join(format!("{candidate_id}.part")) {
             return Err(AppError::new(ErrorCode::Internal));

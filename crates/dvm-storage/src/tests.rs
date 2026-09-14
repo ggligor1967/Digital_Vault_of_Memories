@@ -1066,6 +1066,347 @@ fn runtime_canonical_corruption_latches_repair_required_and_blocks_writes() -> T
     Ok(())
 }
 
+/// Releases a waiting mutator from inside `Vault::recover`'s database guard.
+///
+/// `recover` aborts its sink while it still holds that guard and before it
+/// latches repair state, and it does not release the guard until it returns —
+/// which is after the latch. Signalling from `abort` therefore pins the
+/// interleaving deterministically, with no sleeps: the mutator is released
+/// while the discovering thread provably owns the synchronization boundary,
+/// and cannot acquire that boundary itself until the latch is already visible.
+struct RendezvousSink {
+    barrier: Arc<std::sync::Barrier>,
+    signalled: bool,
+}
+impl PlaintextSink for RendezvousSink {
+    fn stage(&mut self, _: &[u8]) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn commit(&mut self, _: &DigestReceipt) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn abort(&mut self) {
+        // `decrypt` also aborts the sink, so release the mutator exactly once.
+        if !self.signalled {
+            self.signalled = true;
+            self.barrier.wait();
+        }
+    }
+}
+
+/// T1 — CASE B: a canonical mutation must never commit after integrity
+/// discovery has already linearized ahead of it.
+#[test]
+fn write_admission_is_linearized_with_integrity_discovery() -> TestResult {
+    for mutator in ["commit_import", "claim_job", "complete_job"] {
+        let fixture = Fixture::new()?;
+        let vault = fixture.create()?;
+        let imported = dvm_application::storage::import(&vault, &fixture.source(&[4, 2, 7])?)?;
+        assert_eq!(vault.health(), ReconciliationHealth::Healthy);
+
+        // Every input the writer needs is prepared while the vault is still
+        // healthy, so its admission decision is the only thing left to order.
+        let staged = if mutator == "commit_import" {
+            let second = fixture.root.join("second import.bin");
+            fs::write(&second, [1, 1, 2])?;
+            Some(vault.stage_import(&second)?)
+        } else {
+            None
+        };
+        let staging_path = staged.as_ref().map(|staged| staged.staging_path.clone());
+        // The lease deliberately targets a *different*, intact canonical
+        // original from the one that will fail. `complete_job` verifies its own
+        // blob before publishing a result, so a lease on the damaged original
+        // would be refused by that check and prove nothing about admission.
+        let lease = if mutator == "complete_job" {
+            let other = fixture.root.join("second original.bin");
+            fs::write(&other, [9, 9, 9])?;
+            let second = dvm_application::storage::import(&vault, &other)?;
+            let mut selected = None;
+            while let Some(lease) = vault.claim_job(NOW, 60)? {
+                if lease.payload.blob_id == second.blob_id {
+                    selected = Some(lease);
+                }
+            }
+            Some(selected.ok_or("no verification job for the intact original")?)
+        } else {
+            None
+        };
+        // What the refused writer would have touched.
+        let watched_blob = lease.as_ref().map_or_else(
+            || imported.blob_id.clone(),
+            |lease| lease.payload.blob_id.clone(),
+        );
+
+        let before = (
+            count(&vault, "blobs")?,
+            count(&vault, "items")?,
+            count(&vault, "item_blobs")?,
+            count(&vault, "jobs")?,
+        );
+        let job_id: String = match &lease {
+            Some(lease) => lease.id.clone(),
+            None => vault
+                .db()?
+                .query_row("SELECT id FROM jobs LIMIT 1", [], |row| row.get(0))?,
+        };
+        let job_before = status(&vault, &job_id)?;
+        let verified_before: Option<String> = vault.db()?.query_row(
+            "SELECT verified_at FROM blobs WHERE id=?1",
+            [&watched_blob],
+            |row| row.get(0),
+        )?;
+
+        // Damage the canonical original after startup reconciliation ran.
+        fs::remove_file(canonical(&vault, &imported.blob_id))?;
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        // A shared borrow, so the `move` closure captures the reference and
+        // both threads drive the same vault instance.
+        let shared = &vault;
+        let refused = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                // Armed on the writer's own thread: the seam is thread-local,
+                // so it releases this mutator and nothing else.
+                crate::vault::ADMISSION_RENDEZVOUS.with(|slot| slot.set(Some(writer_barrier)));
+                match mutator {
+                    "commit_import" => staged
+                        .ok_or_else(|| AppError::new(ErrorCode::Internal))
+                        .and_then(|staged| shared.commit_import(staged))
+                        .map(|_| ()),
+                    "claim_job" => shared.claim_job(NOW, 60).map(|_| ()),
+                    _ => lease
+                        .ok_or_else(|| AppError::new(ErrorCode::Internal))
+                        .and_then(|lease| shared.complete_job(&lease, NOW)),
+                }
+            });
+
+            // The discovering thread holds the database guard, releases the
+            // writer from inside it, then latches repair state and only then
+            // lets go.
+            let mut sink = RendezvousSink {
+                barrier: Arc::clone(&barrier),
+                signalled: false,
+            };
+            let discovered = shared.recover(&imported.blob_id, &mut sink);
+            let joined = writer.join();
+            (discovered, joined)
+        });
+
+        assert_eq!(
+            refused
+                .0
+                .err()
+                .ok_or("missing canonical original accepted")?
+                .code,
+            ErrorCode::MissingBlob,
+            "{mutator}"
+        );
+        assert_eq!(
+            vault.health(),
+            ReconciliationHealth::RepairRequired,
+            "{mutator}"
+        );
+
+        // The writer's admission was decided strictly after that latch became
+        // visible, so it must refuse.
+        let refused = refused
+            .1
+            .map_err(|_| "writer thread panicked")?
+            .err()
+            .ok_or(format!("{mutator} admitted after integrity discovery"))?;
+        assert_eq!(refused.code, ErrorCode::MissingBlob, "{mutator}");
+
+        // Nothing the blocked writer would have written may exist.
+        assert_eq!(
+            (
+                count(&vault, "blobs")?,
+                count(&vault, "items")?,
+                count(&vault, "item_blobs")?,
+                count(&vault, "jobs")?,
+            ),
+            before,
+            "{mutator} committed canonical rows"
+        );
+        assert_eq!(
+            status(&vault, &job_id)?,
+            job_before,
+            "{mutator} moved job state"
+        );
+        let verified_after: Option<String> = vault.db()?.query_row(
+            "SELECT verified_at FROM blobs WHERE id=?1",
+            [&watched_blob],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            verified_after, verified_before,
+            "{mutator} published a result"
+        );
+        if let Some(path) = staging_path {
+            // The encrypted candidate survives as reconcilable temporary state:
+            // recoverable, unlike a false canonical success.
+            assert!(path.is_file(), "refused staging was destroyed");
+        }
+        assert_eq!(
+            vault.health(),
+            ReconciliationHealth::RepairRequired,
+            "{mutator}"
+        );
+    }
+    Ok(())
+}
+
+/// T1 — CASE A: the opposite order is legal. A writer that linearizes before
+/// discovery commits normally; the later discovery still latches, and the next
+/// mutation is refused.
+#[test]
+fn writer_that_linearizes_first_commits_and_later_discovery_still_closes() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let imported = dvm_application::storage::import(&vault, &fixture.source(&[4, 2, 7])?)?;
+    let second = fixture.root.join("second import.bin");
+    fs::write(&second, [1, 1, 2])?;
+    let staged = vault.stage_import(&second)?;
+
+    // The writer takes the admission guard first and runs to completion.
+    let committed = std::thread::scope(|scope| scope.spawn(|| vault.commit_import(staged)).join())
+        .map_err(|_| "writer thread panicked")??;
+    assert_eq!(count(&vault, "blobs")?, 2);
+    assert_eq!(count(&vault, "items")?, 2);
+    assert_eq!(vault.health(), ReconciliationHealth::Healthy);
+
+    // Corruption discovered afterwards still latches, exactly as before.
+    fs::remove_file(canonical(&vault, &imported.blob_id))?;
+    let mut sink = BytesSink::default();
+    assert_eq!(
+        vault
+            .recover(&imported.blob_id, &mut sink)
+            .err()
+            .ok_or("missing canonical original accepted")?
+            .code,
+        ErrorCode::MissingBlob
+    );
+    assert_eq!(vault.health(), ReconciliationHealth::RepairRequired);
+
+    // The commit that linearized first stays committed; the next one is refused.
+    let survived: String = vault.db()?.query_row(
+        "SELECT status FROM items WHERE id=?1",
+        [&committed.item_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(survived, "IMPORTED");
+    let third = fixture.root.join("third import.bin");
+    fs::write(&third, [3, 3, 3])?;
+    assert_eq!(
+        dvm_application::storage::import(&vault, &third)
+            .err()
+            .ok_or("import admitted after integrity discovery")?
+            .code,
+        ErrorCode::MissingBlob
+    );
+    assert_eq!(count(&vault, "blobs")?, 2);
+    assert_eq!(count(&vault, "items")?, 2);
+    Ok(())
+}
+
+/// T2 storage oracle: an operational read failure over an intact canonical
+/// original must leave the item, the vault health and write admission alone.
+#[test]
+fn operational_canonical_read_failure_never_condemns_intact_data() -> TestResult {
+    // One offset per DVB1 read phase, all strictly after a successful open.
+    for (phase, offset) in [
+        ("header", 10),
+        ("header authentication tag", 56),
+        ("frame index/length", 72),
+        ("encrypted frame payload", 84),
+        ("trailing byte", 99),
+    ] {
+        let fixture = Fixture::new()?;
+        let vault = fixture.create()?;
+        let imported = dvm_application::storage::import(&vault, &fixture.source(&[5, 5, 9])?)?;
+        let stored = canonical(&vault, &imported.blob_id);
+        assert!(stored.is_file());
+        assert_eq!(
+            fs::metadata(&stored)?.len(),
+            99,
+            "{phase}: unexpected layout"
+        );
+
+        crate::vault::READ_FAULT.with(|fault| {
+            fault.set(Some((offset, std::io::ErrorKind::PermissionDenied)));
+        });
+        let mut blocked = BytesSink::default();
+        let operational = vault
+            .recover(&imported.blob_id, &mut blocked)
+            .err()
+            .ok_or(format!("{phase}: operational read failure accepted"))?;
+        assert_eq!(operational.code, ErrorCode::Internal, "{phase}");
+        assert_ne!(operational.code, ErrorCode::BlobAuthFailed, "{phase}");
+        assert_ne!(operational.code, ErrorCode::MissingBlob, "{phase}");
+        assert!(
+            blocked.aborted && blocked.committed.is_empty() && blocked.staged.is_empty(),
+            "{phase}: partial plaintext survived"
+        );
+
+        // Item status unchanged, health unchanged, admission unchanged.
+        let untouched: String = vault.db()?.query_row(
+            "SELECT status FROM items WHERE id=?1",
+            [&imported.item_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(untouched, "IMPORTED", "{phase}");
+        assert_eq!(vault.health(), ReconciliationHealth::Healthy, "{phase}");
+        let next = fixture.root.join("after operational failure.bin");
+        fs::write(&next, [7, 7, 7])?;
+        dvm_application::storage::import(&vault, &next)?;
+
+        // Transient means transient: the same original still recovers whole.
+        let mut restored = BytesSink::default();
+        vault.recover(&imported.blob_id, &mut restored)?;
+        assert_eq!(restored.committed, vec![5, 5, 9], "{phase}");
+
+        // Control: a real authentication failure at the same phase still
+        // condemns the item and closes write admission.
+        let mut bytes = fs::read(&stored)?;
+        let target = if offset >= bytes.len() {
+            bytes.len() - 1
+        } else {
+            offset
+        };
+        bytes[target] ^= 1;
+        fs::write(&stored, bytes)?;
+        let mut condemned_sink = BytesSink::default();
+        let authentication = vault
+            .recover(&imported.blob_id, &mut condemned_sink)
+            .err()
+            .ok_or(format!("{phase}: canonical corruption accepted"))?;
+        assert_eq!(authentication.code, ErrorCode::BlobAuthFailed, "{phase}");
+        let condemned: String = vault.db()?.query_row(
+            "SELECT status FROM items WHERE id=?1",
+            [&imported.item_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(condemned, "CORRUPTED", "{phase}");
+        assert_eq!(
+            vault.health(),
+            ReconciliationHealth::RepairRequired,
+            "{phase}"
+        );
+        let last = fixture.root.join("after authentication failure.bin");
+        fs::write(&last, [8, 8, 8])?;
+        assert_eq!(
+            dvm_application::storage::import(&vault, &last)
+                .err()
+                .ok_or(format!("{phase}: import admitted after corruption"))?
+                .code,
+            ErrorCode::MissingBlob,
+            "{phase}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn verified_at_uses_one_canonical_utc_representation_for_every_writer() -> TestResult {
     let fixture = Fixture::new()?;
