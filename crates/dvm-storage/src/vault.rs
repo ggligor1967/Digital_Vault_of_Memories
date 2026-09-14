@@ -11,10 +11,15 @@ use dvm_domain::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
+    collections::HashSet,
+    ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use uuid::Uuid;
 
@@ -29,6 +34,10 @@ pub struct Vault {
     pub cipher: CipherEvidence,
     /// Reconciliation performed before this instance admits writes.
     pub reconciliation: ReconciliationReport,
+    /// Sticky repair state latched when this instance observes a canonical
+    /// integrity failure at runtime. G1 implements no repair operation, so the
+    /// vault stays non-writable for the rest of its lifetime (fail closed).
+    repair_required: AtomicBool,
 }
 
 pub(crate) fn io_error(error: &std::io::Error) -> AppError {
@@ -38,6 +47,48 @@ pub(crate) fn io_error(error: &std::io::Error) -> AppError {
         ErrorCode::Internal
     })
 }
+/// Classifies a failure to reach a canonical blob.
+///
+/// Only a genuinely absent file is `MissingBlob`: that code asserts canonical
+/// data loss and makes `recover` persist `CORRUPTED`. Every other filesystem
+/// failure (sharing violation, permission denied, transient fault) is merely
+/// operational, so it stays an operational error and never accuses intact
+/// bytes of being lost.
+pub(crate) fn blob_io_error(error: &std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        AppError::new(ErrorCode::MissingBlob)
+    } else {
+        io_error(error)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only canonical-open fault seam for deterministic, cross-platform
+    /// operational-error injection. One-shot, thread-local and absent from
+    /// production builds, so it is never a runtime fault-injection surface.
+    pub(crate) static OPEN_FAULT: std::cell::Cell<Option<std::io::ErrorKind>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn open_canonical(path: &Path) -> std::io::Result<File> {
+    #[cfg(test)]
+    if let Some(kind) = OPEN_FAULT.with(std::cell::Cell::take) {
+        return Err(std::io::Error::from(kind));
+    }
+    File::open(path)
+}
+
+/// Orphan classification for one `blobs/` directory entry.
+///
+/// Takes a membership set built once by the caller: the directory scan must
+/// stay `O(files)`, never rescan every database row per file.
+pub(crate) fn referenced(known: &HashSet<&str>, name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_suffix(".dvb"))
+        .is_some_and(|id| known.contains(id))
+}
+
 pub(crate) fn uuid_bytes(id: &str) -> Result<[u8; 16], AppError> {
     let parsed = Uuid::parse_str(id).map_err(|_| AppError::new(ErrorCode::CorruptDatabase))?;
     if parsed.to_string() != id {
@@ -109,6 +160,7 @@ impl Vault {
             _ownership: ownership,
             cipher,
             reconciliation: healthy_report(),
+            repair_required: AtomicBool::new(false),
         })
     }
 
@@ -162,6 +214,7 @@ impl Vault {
             _ownership: ownership,
             cipher,
             reconciliation: healthy_report(),
+            repair_required: AtomicBool::new(false),
         };
         vault.reconciliation = vault.reconcile(now)?;
         Ok(vault)
@@ -173,8 +226,43 @@ impl Vault {
             .map_err(|_| AppError::new(ErrorCode::Internal))
     }
 
+    /// Live write-admission health.
+    ///
+    /// Starts at the startup reconciliation verdict and latches permanently to
+    /// `RepairRequired` once this instance observes a canonical integrity
+    /// failure, so a corruption discovered after startup is not masked by a
+    /// stale healthy snapshot.
+    #[must_use]
+    pub fn health(&self) -> ReconciliationHealth {
+        if self.repair_required.load(Ordering::Acquire) {
+            return ReconciliationHealth::RepairRequired;
+        }
+        self.reconciliation.health
+    }
+
+    /// Latches sticky repair state for a canonical integrity failure, and
+    /// reports whether the observed code was one. Operational errors are not
+    /// integrity failures and must leave both health and item status alone.
+    fn note_canonical_integrity_failure(&self, code: ErrorCode) -> bool {
+        if matches!(code, ErrorCode::MissingBlob | ErrorCode::BlobAuthFailed) {
+            self.repair_required.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    /// Authenticates canonical bytes on behalf of a mutating caller, latching
+    /// sticky repair state if the canonical original turns out to be unusable.
+    pub(crate) fn verify_canonical(&self, db: &Connection, id: &str) -> Result<(), AppError> {
+        self.recover_locked(db, id, &mut VerifyOnly)
+            .map(|_| ())
+            .inspect_err(|error| {
+                self.note_canonical_integrity_failure(error.code);
+            })
+    }
+
     pub(crate) fn require_writable(&self) -> Result<(), AppError> {
-        if self.reconciliation.health != ReconciliationHealth::Healthy {
+        if self.health() != ReconciliationHealth::Healthy {
             return Err(AppError::new(ErrorCode::MissingBlob));
         }
         Ok(())
@@ -192,10 +280,9 @@ impl Vault {
         let result = self.recover_locked(&db, id, sink);
         if let Err(error) = &result {
             sink.abort();
-            if matches!(
-                error.code,
-                ErrorCode::MissingBlob | ErrorCode::BlobAuthFailed
-            ) {
+            // Only a canonical integrity failure condemns the data. An
+            // operational error leaves item status and write admission intact.
+            if self.note_canonical_integrity_failure(error.code) {
                 db.execute("UPDATE items SET status='CORRUPTED' WHERE id IN (SELECT item_id FROM item_blobs WHERE blob_id=?1)", [id]).map_err(|error| db_error(&error))?;
             }
         }
@@ -216,12 +303,11 @@ impl Vault {
             return Err(AppError::new(ErrorCode::UnsupportedVaultVersion));
         }
         let path = self.root.join(expected_path);
-        let metadata =
-            fs::symlink_metadata(&path).map_err(|_| AppError::new(ErrorCode::MissingBlob))?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| blob_io_error(&error))?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(AppError::new(ErrorCode::BlobAuthFailed));
         }
-        let mut file = File::open(path).map_err(|_| AppError::new(ErrorCode::MissingBlob))?;
+        let mut file = open_canonical(&path).map_err(|error| blob_io_error(&error))?;
         let id = uuid_bytes(id)?;
         decrypt(
             &mut file,
@@ -276,14 +362,12 @@ impl Vault {
                 Err(error) => return Err(error),
             }
         }
+        // Built once, before the scan: a per-file rescan of every row makes
+        // startup O(files x rows) and unbounded on a large vault.
+        let known: HashSet<&str> = ids.iter().map(String::as_str).collect();
         for entry in fs::read_dir(self.root.join("blobs")).map_err(|error| io_error(&error))? {
             let entry = entry.map_err(|error| io_error(&error))?;
-            let name = entry.file_name();
-            let referenced = name
-                .to_str()
-                .and_then(|name| name.strip_suffix(".dvb"))
-                .is_some_and(|id| ids.iter().any(|known| known == id));
-            if !referenced {
+            if !referenced(&known, &entry.file_name()) {
                 self.quarantine(&entry.path())?;
                 report.quarantined_orphans += 1;
                 report.health = ReconciliationHealth::RepairRequired;
@@ -431,7 +515,7 @@ impl ImportRepository for Vault {
             if u64::try_from(size).ok() != Some(staged.size_bytes) {
                 return Err(AppError::new(ErrorCode::CorruptDatabase));
             }
-            self.recover_locked(&db, &id, &mut VerifyOnly)?;
+            self.verify_canonical(&db, &id)?;
             fs::remove_file(&staged.staging_path).map_err(|error| io_error(&error))?;
             (id, false)
         } else {

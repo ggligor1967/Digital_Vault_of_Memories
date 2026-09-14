@@ -1,7 +1,7 @@
 //! Transactional leases and verification result commits. No future processing worker.
 use crate::{
     database::db_error,
-    vault::{Vault, VerifyOnly, uuid_bytes},
+    vault::{Vault, uuid_bytes},
 };
 use dvm_crypto::random_id;
 use dvm_domain::{
@@ -11,12 +11,22 @@ use dvm_domain::{
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-// Fixed-width decimal Unix seconds: UTC, lexicographically sortable and unambiguous.
+// Fixed-width decimal Unix seconds: UTC, lexicographically sortable and
+// unambiguous. Job scheduling columns (available_at, lease_until, created_at,
+// updated_at) are ordered and compared as text, so they keep this form.
 pub(crate) fn timestamp(seconds: u64) -> Result<String, AppError> {
     if seconds > i64::MAX as u64 {
         return Err(AppError::new(ErrorCode::Internal));
     }
     Ok(format!("{seconds:020}"))
+}
+
+// Blob metadata timestamps are a different convention from job scheduling: they
+// are UTC ISO-8601 text. Binding Unix seconds and letting SQLite render them
+// keeps one grammar across every `blobs.verified_at` writer, using the same
+// strftime format as the insertion in `Vault::commit_import`.
+fn unix_seconds(seconds: u64) -> Result<i64, AppError> {
+    i64::try_from(seconds).map_err(|_| AppError::new(ErrorCode::Internal))
 }
 
 pub(crate) fn enqueue_verification(
@@ -79,11 +89,11 @@ impl JobRepository for Vault {
         if status == "DONE" {
             return Ok(());
         }
-        self.recover_locked(&db, &lease.payload.blob_id, &mut VerifyOnly)?;
+        self.verify_canonical(&db, &lease.payload.blob_id)?;
         let tx = db.transaction().map_err(|error| db_error(&error))?;
         tx.execute(
-            "UPDATE blobs SET verified_at=?1 WHERE id=?2",
-            params![timestamp(now)?, lease.payload.blob_id],
+            "UPDATE blobs SET verified_at=strftime('%Y-%m-%dT%H:%M:%fZ',?1,'unixepoch') WHERE id=?2",
+            params![unix_seconds(now)?, lease.payload.blob_id],
         )
         .map_err(|error| db_error(&error))?;
         tx.execute(
