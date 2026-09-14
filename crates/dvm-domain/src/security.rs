@@ -135,3 +135,250 @@ pub trait SessionBackend: Send {
     /// Current storage admission health.
     fn health(active: &Self::Active) -> ReconciliationHealth;
 }
+
+/// Canonical prefix of every device credential reference.
+pub const DEVICE_REFERENCE_PREFIX: &str = "dvm/device/";
+/// Canonical prefix of every provider credential reference.
+pub const PROVIDER_REFERENCE_PREFIX: &str = "dvm/provider/";
+/// Shortest admissible credential reference: a prefix plus a non-empty suffix.
+const REFERENCE_MIN_LEN: usize = 12;
+/// Longest admissible credential reference.
+const REFERENCE_MAX_LEN: usize = 160;
+
+/// The single canonical credential-reference grammar.
+///
+/// Persisted keyslot admission and the operating-system credential adapter
+/// must accept exactly the same language, otherwise a header can be admitted
+/// whose device credential the adapter later refuses, making quick unlock
+/// permanently impossible. Both call this function so the two languages cannot
+/// drift apart.
+///
+/// A reference is bounded ASCII: lowercase letters, digits, `/` and `-`,
+/// carrying an exact application prefix. Uppercase is rejected rather than
+/// normalised, so a malformed reference fails closed at admission.
+#[must_use]
+pub fn is_canonical_credential_reference(reference: &str) -> bool {
+    (REFERENCE_MIN_LEN..=REFERENCE_MAX_LEN).contains(&reference.len())
+        && (reference.starts_with(DEVICE_REFERENCE_PREFIX)
+            || reference.starts_with(PROVIDER_REFERENCE_PREFIX))
+        && reference
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"/-".contains(&b))
+}
+
+/// The canonical grammar restricted to the device credential prefix.
+///
+/// Every reference accepted here is accepted by
+/// [`is_canonical_credential_reference`], and therefore by the credential
+/// adapter.
+#[must_use]
+pub fn is_canonical_device_reference(reference: &str) -> bool {
+    reference.starts_with(DEVICE_REFERENCE_PREFIX) && is_canonical_credential_reference(reference)
+}
+
+/// Durability of a vault header that has already passed its activation point.
+///
+/// The activation point is the successful atomic replacement of `vault.header`
+/// by a validated new header. Before it the old header is authoritative; after
+/// it the new header is, and no later failure may be reported as though the old
+/// credentials were still valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderDurability {
+    /// The activated header was synced and re-read successfully.
+    Durable,
+    /// The activated header is authoritative, but a post-activation durability
+    /// or verification step did not complete. The new credentials are valid and
+    /// must be retained; the envelope describes only the secondary failure.
+    Uncertain(AppError),
+}
+
+impl HeaderDurability {
+    /// Whether the activated header was also proven durable.
+    #[must_use]
+    pub const fn is_durable(&self) -> bool {
+        matches!(self, Self::Durable)
+    }
+    /// The non-secret secondary failure, when durability is uncertain.
+    #[must_use]
+    pub const fn uncertainty(&self) -> Option<&AppError> {
+        match self {
+            Self::Durable => None,
+            Self::Uncertain(error) => Some(error),
+        }
+    }
+    /// Records a post-activation failure without ever revoking activation.
+    ///
+    /// The first uncertainty is kept, so a chain of secondary failures cannot
+    /// obscure the one that actually broke durability.
+    #[must_use]
+    pub fn degraded(self, error: AppError) -> Self {
+        match self {
+            Self::Durable => Self::Uncertain(error),
+            uncertain @ Self::Uncertain(_) => uncertain,
+        }
+    }
+}
+
+/// Disposition of best-effort removal of a credential that the authoritative
+/// header does not reference.
+///
+/// Cleanup is always secondary evidence: it never replaces a primary error and
+/// never converts a completed activation into a failure. No variant carries
+/// credential material; [`AppError`] is the non-secret envelope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    /// No unreferenced credential needed removal.
+    #[default]
+    NotRequired,
+    /// The unreferenced credential was removed.
+    Completed,
+    /// The unreferenced credential remains and must be reclaimed later. The
+    /// envelope is boxed so that carrying cleanup evidence never inflates the
+    /// error arm of a lifecycle result.
+    Failed(Box<AppError>),
+}
+
+impl CleanupOutcome {
+    /// Whether an unreferenced credential is known to remain in the OS store.
+    #[must_use]
+    pub const fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+    /// The non-secret envelope of a failed cleanup.
+    #[must_use]
+    pub fn failure(&self) -> Option<&AppError> {
+        match self {
+            Self::Failed(error) => Some(error.as_ref()),
+            Self::NotRequired | Self::Completed => None,
+        }
+    }
+}
+
+/// A trusted keyslot operation whose header replacement passed the activation
+/// point.
+///
+/// Holding this value means the new credential state is already authoritative:
+/// the caller must adopt the new credentials and must not fall back to the
+/// previous ones. Any newly generated secret is carried in the value, so
+/// activation can never silently destroy recoverable material.
+pub struct Activated<T> {
+    value: T,
+    durability: HeaderDurability,
+    cleanup: CleanupOutcome,
+}
+
+impl<T> Activated<T> {
+    /// Records an activation together with its secondary evidence.
+    #[must_use]
+    pub const fn new(value: T, durability: HeaderDurability, cleanup: CleanupOutcome) -> Self {
+        Self {
+            value,
+            durability,
+            cleanup,
+        }
+    }
+    /// Borrows the newly authoritative material.
+    #[must_use]
+    pub const fn value(&self) -> &T {
+        &self.value
+    }
+    /// Takes ownership of the newly authoritative material.
+    #[must_use]
+    pub fn into_value(self) -> T {
+        self.value
+    }
+    /// Post-activation durability of the now authoritative header.
+    #[must_use]
+    pub const fn durability(&self) -> &HeaderDurability {
+        &self.durability
+    }
+    /// Disposition of any unreferenced predecessor credential.
+    #[must_use]
+    pub const fn cleanup(&self) -> &CleanupOutcome {
+        &self.cleanup
+    }
+    /// Whether activation was durable and left no unreferenced credential.
+    #[must_use]
+    pub const fn is_fully_settled(&self) -> bool {
+        self.durability.is_durable() && matches!(self.cleanup, CleanupOutcome::NotRequired)
+    }
+    /// Rewrites the carried material, preserving the activation evidence.
+    #[must_use]
+    pub fn map<U>(self, operation: impl FnOnce(T) -> U) -> Activated<U> {
+        Activated {
+            value: operation(self.value),
+            durability: self.durability,
+            cleanup: self.cleanup,
+        }
+    }
+}
+
+/// A trusted keyslot operation that failed strictly before the activation
+/// point.
+///
+/// The previously active credential state remains authoritative, so the caller
+/// must keep using the old credentials. The primary failure is always
+/// preserved: a failed best-effort cleanup is recorded alongside it and never
+/// replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotActivated {
+    primary: AppError,
+    cleanup: CleanupOutcome,
+}
+
+impl NotActivated {
+    /// Records a pre-activation failure and the disposition of its cleanup.
+    #[must_use]
+    pub const fn new(primary: AppError, cleanup: CleanupOutcome) -> Self {
+        Self { primary, cleanup }
+    }
+    /// The primary failure. This is the cause the caller must act on.
+    #[must_use]
+    pub const fn primary(&self) -> &AppError {
+        &self.primary
+    }
+    /// Disposition of the credential the still-active old header does not
+    /// reference.
+    #[must_use]
+    pub const fn cleanup(&self) -> &CleanupOutcome {
+        &self.cleanup
+    }
+    /// Attaches secondary cleanup evidence without disturbing the primary
+    /// failure.
+    #[must_use]
+    pub fn with_cleanup(mut self, cleanup: CleanupOutcome) -> Self {
+        self.cleanup = cleanup;
+        self
+    }
+    /// Unwraps to the primary envelope for callers that carry only `AppError`.
+    #[must_use]
+    pub fn into_primary(self) -> AppError {
+        self.primary
+    }
+}
+
+impl From<AppError> for NotActivated {
+    fn from(primary: AppError) -> Self {
+        Self::new(primary, CleanupOutcome::NotRequired)
+    }
+}
+
+impl core::fmt::Display for NotActivated {
+    /// Renders the primary envelope first, then a classification of the
+    /// secondary cleanup. Neither carries credential material.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "not activated: {}", self.primary)?;
+        match &self.cleanup {
+            CleanupOutcome::NotRequired => Ok(()),
+            CleanupOutcome::Completed => write!(f, "; cleanup completed"),
+            CleanupOutcome::Failed(error) => write!(f, "; cleanup failed: {error}"),
+        }
+    }
+}
+
+impl core::error::Error for NotActivated {}
+
+/// Outcome of a trusted keyslot lifecycle operation, phase-aware by
+/// construction: the success arm can only be built after activation and the
+/// failure arm only before it, so no caller can confuse the two states.
+pub type Committed<T> = Result<Activated<T>, NotActivated>;

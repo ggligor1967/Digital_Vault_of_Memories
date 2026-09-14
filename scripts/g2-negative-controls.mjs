@@ -9,6 +9,11 @@ function replaceOnce(source, before, after) {
   if (source.split(before).length !== 2) throw new Error('Negative control seam drifted.');
   return source.replace(before, after);
 }
+/** Joins multi-line seams with the newline the checkout actually uses. */
+function replaceBlock(source, before, after) {
+  const eol = source.includes('\r\n') ? '\r\n' : '\n';
+  return replaceOnce(source, before.join(eol), after.join(eol));
+}
 const cases = [
   {
     name: 'native-archive-pin',
@@ -107,6 +112,93 @@ const cases = [
       'locked_operation_guard_is_effective',
     ],
     marker: 'locked operation was admitted',
+  },
+  {
+    name: 'activated-header-ambiguity',
+    path: 'crates/dvm-storage/src/security.rs',
+    mutate: (s) =>
+      replaceBlock(
+        s,
+        [
+          '    if let Err(error) = checkpoint("after-activation") {',
+          '        return Ok(HeaderDurability::Uncertain(error));',
+          '    }',
+        ],
+        ['    checkpoint("after-activation")?;'],
+      ),
+    args: [
+      'test',
+      '--locked',
+      '-p',
+      'dvm-storage',
+      '--lib',
+      'header_failure_matrix_separates_pre_and_post_activation',
+    ],
+    marker: 'committed activation reported as failure',
+  },
+  {
+    name: 'credential-reference-validator-drift',
+    path: 'crates/dvm-crypto/src/keyslots.rs',
+    mutate: (s) =>
+      replaceOnce(
+        s,
+        '&& is_canonical_device_reference(&slot.credential_ref) => {}',
+        '&& (is_canonical_device_reference(&slot.credential_ref) || slot.credential_ref.starts_with("dvm/device/")) => {}',
+      ),
+    args: [
+      'test',
+      '--locked',
+      '-p',
+      'dvm-storage',
+      '--lib',
+      'credential_reference_language_is_shared_by_keyslot_and_adapter',
+    ],
+    marker: 'keyslot admitted a reference the credential adapter refuses',
+  },
+  {
+    name: 'cleanup-overrides-primary-failure',
+    path: 'crates/dvm-storage/src/security.rs',
+    mutate: (s) =>
+      replaceBlock(
+        s,
+        [
+          '            // The store failure stays primary; cleanup is recorded beside it.',
+          '            let cleanup = self.discard(&reference);',
+          '            return Err(NotActivated::new(primary, cleanup));',
+        ],
+        [
+          '            self.credentials.delete(&reference)?;',
+          '            return Err(primary.into());',
+        ],
+      ),
+    args: [
+      'test',
+      '--locked',
+      '-p',
+      'dvm-storage',
+      '--lib',
+      'cleanup_failure_is_recorded_without_replacing_the_primary_failure',
+    ],
+    marker: 'cleanup failure replaced the primary store error',
+  },
+  {
+    name: 'stale-device-slot-unrecoverable',
+    path: 'crates/dvm-storage/src/security.rs',
+    mutate: (s) =>
+      replaceOnce(
+        s,
+        'if self.credentials.retrieve(&existing)?.is_some() {',
+        'if envelope.keyslots[index].slot_type == "device-v1" {',
+      ),
+    args: [
+      'test',
+      '--locked',
+      '-p',
+      'dvm-storage',
+      '--lib',
+      'stale_device_slot_is_re_enrolled_only_on_proven_absence',
+    ],
+    marker: 'an operational credential-store failure was mistaken for absence',
   },
 ];
 

@@ -1,7 +1,7 @@
 //! Windows user-context generic credentials with explicit local persistence.
 use dvm_domain::{
     AppError, ErrorCode,
-    security::{CredentialStore, SecretValue},
+    security::{CredentialStore, SecretValue, is_canonical_credential_reference},
 };
 
 /// Native adapter. No ambient keyring default and no renderer-accessible interface.
@@ -11,17 +11,14 @@ pub struct WindowsCredentialStore;
 fn failure() -> AppError {
     AppError::new(ErrorCode::ProviderUnavailable)
 }
-fn validate_reference(reference: &str) -> Result<(), AppError> {
-    if reference.len() > 180
-        || reference.len() < 12
-        || !(reference.starts_with("dvm/device/") || reference.starts_with("dvm/provider/"))
-        || !reference
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"/-".contains(&b))
-    {
-        return Err(failure());
+/// Admission through the one canonical grammar shared with keyslot validation,
+/// so the two languages cannot drift apart.
+pub(crate) fn validate_reference(reference: &str) -> Result<(), AppError> {
+    if is_canonical_credential_reference(reference) {
+        Ok(())
+    } else {
+        Err(failure())
     }
-    Ok(())
 }
 
 #[cfg(windows)]

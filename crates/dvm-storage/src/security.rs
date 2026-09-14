@@ -6,7 +6,10 @@ use dvm_crypto::{
 };
 use dvm_domain::{
     AppError, ErrorCode,
-    security::{ArgonProfile, CredentialStore, RecoveryPolicy, SecretValue, SessionBackend},
+    security::{
+        Activated, ArgonProfile, CleanupOutcome, Committed, CredentialStore, HeaderDurability,
+        NotActivated, RecoveryPolicy, SecretValue, SessionBackend,
+    },
     storage::{ImportReceipt, ImportRepository, ReconciliationHealth, VaultHeader},
 };
 use std::{
@@ -73,12 +76,17 @@ fn checkpoint(point: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn replace_header(root: &Path, new: &VaultHeader) -> Result<(), AppError> {
+/// `HEADER_ACTIVATED` is the successful atomic replacement of `vault.header` by
+/// the validated new header. It is the single linearization point of the
+/// keyslot lifecycle: before it the old header is authoritative, after it the
+/// new one is. The return type carries that phase, so a post-activation
+/// durability failure can never be mistaken for a pre-activation failure.
+fn replace_header(root: &Path, new: &VaultHeader) -> Result<HeaderDurability, NotActivated> {
     let bytes = header::serialize(new)?;
     #[cfg(test)]
     checkpoint("before-temp")?;
     let temp = root.join(format!(".keyslot-{}.tmp", Uuid::new_v4()));
-    let result = (|| {
+    let staged = (|| -> Result<(), AppError> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -94,54 +102,79 @@ fn replace_header(root: &Path, new: &VaultHeader) -> Result<(), AppError> {
         drop(file);
         #[cfg(test)]
         checkpoint("before-activation")?;
-        fs::rename(&temp, root.join("vault.header")).map_err(|e| io_error(&e))?;
-        #[cfg(test)]
-        checkpoint("after-activation")?;
-        OpenOptions::new()
-            .write(true)
-            .open(root.join("vault.header"))
-            .and_then(|f| f.sync_all())
-            .map_err(|e| io_error(&e))?;
-        Ok(())
+        fs::rename(&temp, root.join("vault.header")).map_err(|e| io_error(&e))
     })();
-    // This name was created by this invocation, and never names user content.
-    if temp.exists() {
-        let _ = fs::remove_file(&temp);
+    if let Err(error) = staged {
+        // This name was created by this invocation, and never names user content.
+        if temp.exists() {
+            let _ = fs::remove_file(&temp);
+        }
+        return Err(NotActivated::from(error));
     }
-    result
+    // Past the activation point. Every remaining failure is durability
+    // uncertainty about credentials that are already authoritative.
+    #[cfg(test)]
+    if let Err(error) = checkpoint("after-activation") {
+        return Ok(HeaderDurability::Uncertain(error));
+    }
+    let durable = OpenOptions::new()
+        .write(true)
+        .open(root.join("vault.header"))
+        .and_then(|f| f.sync_all());
+    #[cfg(test)]
+    if let Err(error) = checkpoint("post-activation-sync") {
+        return Ok(HeaderDurability::Uncertain(error));
+    }
+    match durable {
+        Ok(()) => Ok(HeaderDurability::Durable),
+        Err(error) => Ok(HeaderDurability::Uncertain(io_error(&error))),
+    }
+}
+
+/// Everything a caller must receive once vault creation passed the activation
+/// point. The recovery credential is persisted as a keyslot the instant the
+/// header activates, so it is delivered here even when a later durability step
+/// reports uncertainty; dropping it would make that slot unusable forever.
+pub struct CreatedVault {
+    /// Locked backend for the newly activated vault.
+    pub backend: ProtectedVault,
+    /// Generated recovery credential, present exactly when the policy asked
+    /// for one and the recovery slot is therefore active in `vault.header`.
+    pub recovery: Option<RecoverySecret>,
 }
 
 impl ProtectedVault {
     /// Default production creation generates recovery and calibrates the KDF.
+    ///
+    /// A successful return means the header activated, so the generated
+    /// recovery credential is already persisted and is always delivered.
     /// # Errors
-    /// Refuses existing paths and fails closed on any crypto or storage error.
+    /// Refuses existing paths and fails closed on any pre-activation crypto or
+    /// storage error; the vault is then not created.
     pub fn create(
         root: &Path,
         passphrase: &Passphrase,
         credentials: Arc<dyn CredentialStore>,
-    ) -> Result<(Self, RecoverySecret), AppError> {
-        let (backend, recovery) = Self::create_with_policy(
+    ) -> Committed<CreatedVault> {
+        Self::create_with_policy(
             root,
             passphrase,
             RecoveryPolicy::Generate,
             keyslots::calibrate()?.0,
             credentials,
-        )?;
-        Ok((
-            backend,
-            recovery.ok_or_else(|| AppError::new(ErrorCode::Internal))?,
-        ))
+        )
     }
     /// Explicit trusted policy and validated production costs, including acknowledged decline.
     /// # Errors
-    /// Invalid profile or failure to durably bootstrap a new vault.
+    /// Invalid profile, or a pre-activation failure to bootstrap a new vault.
+    /// A failure here means no header ever activated.
     pub fn create_with_policy(
         root: &Path,
         passphrase: &Passphrase,
         policy: RecoveryPolicy,
         profile: ArgonProfile,
         credentials: Arc<dyn CredentialStore>,
-    ) -> Result<(Self, Option<RecoverySecret>), AppError> {
+    ) -> Committed<CreatedVault> {
         keyslots::validate_profile(profile)?;
         let vmk = VaultMasterKey::generate()?;
         let mut envelope = header::injected_key_header();
@@ -169,9 +202,28 @@ impl ProtectedVault {
             .open(root.join("local-state/keyslots.lock"))
             .and_then(|file| file.sync_all())
             .map_err(|e| io_error(&e))?;
-        replace_header(root, &envelope)?;
+        // Resolved before activation so that nothing fallible stands between
+        // the activation point and delivery of the recovery credential.
+        let canonical = fs::canonicalize(root).map_err(|e| io_error(&e))?;
+        let durability = replace_header(root, &envelope)?;
         drop(vault);
-        Ok((Self::select(root, credentials)?, recovery))
+        // Post-activation verification can only downgrade durability. It must
+        // never withhold the now-persisted recovery credential.
+        let durability = match read_header(&canonical) {
+            Ok(_) => durability,
+            Err(error) => durability.degraded(error),
+        };
+        Ok(Activated::new(
+            CreatedVault {
+                backend: Self {
+                    root: canonical,
+                    credentials,
+                },
+                recovery,
+            },
+            durability,
+            CleanupOutcome::NotRequired,
+        ))
     }
     /// Selects a production envelope without opening private metadata.
     /// # Errors
@@ -247,15 +299,29 @@ impl SessionBackend for ProtectedVault {
 }
 
 impl OpenVault {
+    /// Best-effort removal of a credential no authoritative header references.
+    ///
+    /// Cleanup is secondary evidence only: the caller keeps the primary
+    /// outcome and merely records what this returned.
+    fn discard(&self, reference: &str) -> CleanupOutcome {
+        match self.credentials.delete(reference) {
+            Ok(()) => CleanupOutcome::Completed,
+            Err(error) => CleanupOutcome::Failed(Box::new(error)),
+        }
+    }
     /// Changes only the authenticated header, preserving storage keys and bytes.
+    ///
+    /// A successful return means the replacement passphrase slot activated and
+    /// the new passphrase is authoritative, even when durability is uncertain.
     /// # Errors
-    /// Wrong current passphrase, invalid costs or failed atomic update.
+    /// Wrong current passphrase, invalid costs, or a pre-activation update
+    /// failure that leaves the old passphrase authoritative.
     pub fn change_passphrase(
         &self,
         old: &Passphrase,
         new: &Passphrase,
         profile: ArgonProfile,
-    ) -> Result<(), AppError> {
+    ) -> Committed<()> {
         let mut envelope = read_header(&self.vault.root)?;
         let index = envelope
             .keyslots
@@ -266,41 +332,82 @@ impl OpenVault {
             keyslots::unwrap_passphrase(&envelope.vault_id, &envelope.keyslots[index], old)?;
         // A trusted-in-memory comparison catches accidental slot/root mismatches.
         if unwrapped.storage_keys()?.0.as_bytes() != self.vmk.storage_keys()?.0.as_bytes() {
-            return Err(AppError::new(ErrorCode::CorruptHeader));
+            return Err(AppError::new(ErrorCode::CorruptHeader).into());
         }
         envelope.keyslots[index] =
             keyslots::wrap_passphrase(&envelope.vault_id, &self.vmk, new, profile)?;
-        replace_header(&self.vault.root, &envelope)
+        Ok(Activated::new(
+            (),
+            replace_header(&self.vault.root, &envelope)?,
+            CleanupOutcome::NotRequired,
+        ))
     }
-    /// Adds optional quick-unlock. Independent passphrase/recovery paths remain intact.
+    /// Enrolls quick-unlock, replacing a device slot whose operating-system
+    /// credential is genuinely absent. Passphrase and recovery slots and the
+    /// VMK are untouched, so every independent path keeps working.
+    ///
+    /// A device slot whose credential still exists is left alone; a credential
+    /// store that fails operationally is never treated as absence, because that
+    /// would let an outage destroy a working quick unlock.
+    ///
+    /// A successful return means the device slot activated and its credential
+    /// must be retained even when durability is uncertain.
     /// # Errors
-    /// Existing device slot, OS failure or header update failure.
-    pub fn enable_device(&self) -> Result<(), AppError> {
+    /// A healthy device slot already exists, the credential store failed, or a
+    /// pre-activation header update failed. A failure never leaves the header
+    /// referencing a credential that was cleaned up.
+    pub fn enable_device(&self) -> Committed<()> {
         let mut envelope = read_header(&self.vault.root)?;
-        if envelope.keyslots.iter().any(|s| s.slot_type == "device-v1") {
-            return Err(AppError::new(ErrorCode::CorruptHeader));
-        }
+        let stale = match envelope
+            .keyslots
+            .iter()
+            .position(|s| s.slot_type == "device-v1")
+        {
+            None => None,
+            Some(index) => {
+                let existing = envelope.keyslots[index].credential_ref.clone();
+                // An operational store failure propagates: only proven absence
+                // authorizes replacing a persisted slot.
+                if self.credentials.retrieve(&existing)?.is_some() {
+                    return Err(AppError::new(ErrorCode::CorruptHeader).into());
+                }
+                Some((index, existing))
+            }
+        };
         let key = DeviceKey::generate()?;
         let reference = format!("dvm/device/{}/{}", envelope.vault_id, Uuid::new_v4());
+        // Admission through the canonical reference grammar happens before any
+        // credential reaches the operating-system store.
         let slot = keyslots::wrap_device(&envelope.vault_id, &self.vmk, &key, reference.clone())?;
-        if let Err(error) = self.credentials.store(
+        if let Err(primary) = self.credentials.store(
             &reference,
             &SecretValue::new(Zeroizing::new(key.credential_bytes().to_vec()))?,
         ) {
-            self.credentials.delete(&reference)?;
-            return Err(error);
+            // The store failure stays primary; cleanup is recorded beside it.
+            let cleanup = self.discard(&reference);
+            return Err(NotActivated::new(primary, cleanup));
         }
-        envelope.keyslots.push(slot);
-        if let Err(error) = replace_header(&self.vault.root, &envelope) {
-            // A post-activation durability error must not delete the activated KEK.
-            if read_header(&self.vault.root)
-                .is_ok_and(|h| !h.keyslots.iter().any(|s| s.credential_ref == reference))
-            {
-                self.credentials.delete(&reference)?;
+        match stale {
+            Some((index, _)) => envelope.keyslots[index] = slot,
+            None => envelope.keyslots.push(slot),
+        }
+        let durability = match replace_header(&self.vault.root, &envelope) {
+            Ok(durability) => durability,
+            Err(failure) => {
+                // Strictly pre-activation: the authoritative header cannot
+                // reference the new credential, so removing it is safe and the
+                // header error remains primary.
+                let cleanup = self.discard(&reference);
+                return Err(failure.with_cleanup(cleanup));
             }
-            return Err(error);
-        }
-        Ok(())
+        };
+        // Only now, and only for a predecessor the active header no longer
+        // references. A failure here leaves activation standing.
+        let cleanup = match stale {
+            Some((_, previous)) if previous != reference => self.discard(&previous),
+            _ => CleanupOutcome::NotRequired,
+        };
+        Ok(Activated::new((), durability, cleanup))
     }
     /// Imports through the existing G1 canonical pipeline inside session admission.
     /// # Errors

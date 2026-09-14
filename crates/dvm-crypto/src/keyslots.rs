@@ -6,7 +6,7 @@ use chacha20poly1305::{
 };
 use dvm_domain::{
     AppError, ErrorCode,
-    security::{ArgonProfile, Keyslot},
+    security::{ArgonProfile, Keyslot, is_canonical_device_reference},
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -214,16 +214,14 @@ pub fn validate_slot(slot: &Keyslot) -> Result<(), AppError> {
                 && slot.salt.is_empty()
                 && slot.argon.is_none()
                 && slot.credential_ref.is_empty() => {}
+        // The one canonical grammar, shared with the operating-system
+        // credential adapter: a reference this admits is one that adapter
+        // accepts, so an unusable device slot can never be persisted.
         "device-v1"
             if slot.kdf_algorithm.is_empty()
                 && slot.salt.is_empty()
                 && slot.argon.is_none()
-                && slot.credential_ref.len() <= 160
-                && slot.credential_ref.starts_with("dvm/device/")
-                && slot
-                    .credential_ref
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"/-".contains(&b)) => {}
+                && is_canonical_device_reference(&slot.credential_ref) => {}
         _ => return Err(bad_header()),
     }
     Ok(())

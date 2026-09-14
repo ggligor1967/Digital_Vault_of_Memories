@@ -28,9 +28,22 @@ OS-random. Neither is derived from a passphrase. No raw root secret is serialize
 
 Header replacement validates first, writes a uniquely named same-directory
 envelope with create-new, flushes/syncs it, then atomically renames over
-`vault.header`; the old header remains authoritative until activation. Failure
-injection uses test-only seams. Process crash atomicity is tested; total hardware
-power-loss durability and external rollback prevention are not claimed.
+`vault.header`. That rename is the single activation point: the old header is
+authoritative before it and the new header after it. The operation therefore
+returns a phase-aware outcome rather than a bare error, so a post-activation
+durability or verification failure is reported as uncertainty about an already
+authoritative credential and never as a pre-activation failure. Any credential
+generated for the new header is delivered to the trusted caller whenever
+activation occurred. Failure injection uses test-only seams. Process crash
+atomicity is tested; total hardware power-loss durability and external rollback
+prevention are not claimed.
+
+A device slot carries one canonical credential reference: at most 160 bytes,
+prefixed `dvm/device/`, and restricted to lowercase ASCII letters, digits, `/`
+and `-`. Keyslot admission and the operating-system credential adapter evaluate
+that grammar through one shared predicate, so a header can never be admitted
+whose device credential the adapter would later refuse. Uppercase and every
+other out-of-grammar form is rejected rather than normalised.
 
 Sources inspected: [AEAD](https://docs.rs/chacha20poly1305/0.11.0/chacha20poly1305/),
 [Rust rename](https://doc.rust-lang.org/std/fs/fn.rename.html),

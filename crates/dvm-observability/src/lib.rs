@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_that_sanitises_away_is_dropped() {
+    fn a_key_that_is_not_allowlisted_becomes_the_redacted_field_key() {
         let line = DiagnosticEvent::new("e")
             .with_field("///", "value")
             .to_json_line();
