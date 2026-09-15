@@ -297,10 +297,20 @@ impl<T> Activated<T> {
     pub const fn cleanup(&self) -> &CleanupOutcome {
         &self.cleanup
     }
-    /// Whether activation was durable and left no unreferenced credential.
+    /// Whether activation was durable and left no unreferenced credential in
+    /// the operating-system store.
+    ///
+    /// A cleanup that *completed* removed the unreferenced credential, so it
+    /// leaves no residual work and settles exactly as fully as a cleanup that
+    /// was never required. Only [`CleanupOutcome::Failed`] names a credential
+    /// that is known to remain and must be reclaimed later, so only it keeps a
+    /// durable activation from being fully settled.
+    ///
+    /// The predicate asks [`CleanupOutcome::is_failed`] rather than repeating
+    /// the list of settled variants, so the two cannot drift apart.
     #[must_use]
     pub const fn is_fully_settled(&self) -> bool {
-        self.durability.is_durable() && matches!(self.cleanup, CleanupOutcome::NotRequired)
+        self.durability.is_durable() && !self.cleanup.is_failed()
     }
     /// Rewrites the carried material, preserving the activation evidence.
     #[must_use]
@@ -382,3 +392,52 @@ impl core::error::Error for NotActivated {}
 /// construction: the success arm can only be built after activation and the
 /// failure arm only before it, so no caller can confuse the two states.
 pub type Committed<T> = Result<Activated<T>, NotActivated>;
+#[cfg(test)]
+mod tests {
+    use super::{Activated, CleanupOutcome, HeaderDurability};
+    use crate::{AppError, ErrorCode};
+
+    /// The complete settlement oracle. Durability and cleanup are independent
+    /// axes, so the predicate is pinned over every combination rather than over
+    /// the cases that happen to occur in the current lifecycle paths.
+    #[test]
+    fn settlement_truth_table_is_exhaustive() {
+        let secondary = || AppError::new(ErrorCode::DiskFull);
+        let table = [
+            (true, CleanupOutcome::NotRequired, true),
+            (true, CleanupOutcome::Completed, true),
+            (true, CleanupOutcome::Failed(Box::new(secondary())), false),
+            (false, CleanupOutcome::NotRequired, false),
+            (false, CleanupOutcome::Completed, false),
+            (false, CleanupOutcome::Failed(Box::new(secondary())), false),
+        ];
+        for (durable, cleanup, settled) in table {
+            let durability = if durable {
+                HeaderDurability::Durable
+            } else {
+                HeaderDurability::Uncertain(AppError::new(ErrorCode::Internal))
+            };
+            let activated = Activated::new((), durability, cleanup.clone());
+            assert_eq!(
+                activated.is_fully_settled(),
+                settled,
+                "settlement is wrong for durable={durable} cleanup={cleanup:?}"
+            );
+        }
+        println!("SETTLEMENT_TRUTH_TABLE=PASS");
+    }
+
+    /// A completed cleanup is settled *and* reports no residue, while a failed
+    /// one names its non-secret envelope. This keeps the settlement predicate
+    /// and the cleanup accessors from disagreeing about the same outcome.
+    #[test]
+    fn completed_cleanup_reports_no_remaining_credential() {
+        assert!(!CleanupOutcome::NotRequired.is_failed());
+        assert!(!CleanupOutcome::Completed.is_failed());
+        assert!(CleanupOutcome::NotRequired.failure().is_none());
+        assert!(CleanupOutcome::Completed.failure().is_none());
+        let failed = CleanupOutcome::Failed(Box::new(AppError::new(ErrorCode::DiskFull)));
+        assert!(failed.is_failed());
+        assert_eq!(failed.failure().map(|e| e.code), Some(ErrorCode::DiskFull));
+    }
+}

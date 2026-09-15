@@ -8,7 +8,7 @@ use dvm_domain::{
     AppError, ErrorCode,
     security::{
         Activated, ArgonProfile, CleanupOutcome, Committed, CredentialStore, HeaderDurability,
-        NotActivated, RecoveryPolicy, SecretValue, SessionBackend,
+        Keyslot, NotActivated, RecoveryPolicy, SecretValue, SessionBackend,
     },
     storage::{ImportReceipt, ImportRepository, ReconciliationHealth, VaultHeader},
 };
@@ -29,6 +29,23 @@ pub enum UnlockCredential {
     Recovery(RecoverySecret),
     /// Ask the trusted OS store for a device KEK.
     Device,
+}
+
+/// What the operating-system store actually holds for a persisted device slot.
+///
+/// Presence of a credential is never proof that a device slot works. A
+/// truncated, overwritten or foreign credential leaves quick unlock exactly as
+/// broken as a deleted one, and the header alone cannot tell the two apart, so
+/// the classification is decided by what the credential can do rather than by
+/// whether an entry exists.
+enum DeviceSlotHealth {
+    /// The stored credential authenticates the slot and unwraps the vault's
+    /// active master key. Quick unlock works, so the slot is left untouched.
+    Healthy,
+    /// No credential exists, or the credential that exists cannot unwrap this
+    /// vault's active master key. Quick unlock is broken and an authenticated
+    /// session may replace the slot.
+    Unusable,
 }
 
 /// Locked production backend: contains no VMK or derived storage keys.
@@ -251,16 +268,23 @@ impl SessionBackend for ProtectedVault {
             .try_lock()
             .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
         let envelope = read_header(&self.root)?;
-        let kind = match credential {
-            UnlockCredential::Passphrase(_) => "passphrase-v1",
-            UnlockCredential::Recovery(_) => "recovery-v1",
-            UnlockCredential::Device => "device-v1",
+        // One selection boundary for every credential kind: the slot type it
+        // requires, and the classification for that slot being absent. A vault
+        // with no device slot has no configured quick-unlock path at all, which
+        // is a provider-availability fact rather than a failed authentication
+        // attempt, so it must not be reported as a wrong passphrase. Absent
+        // passphrase and recovery slots keep their existing authentication
+        // classification.
+        let (kind, absent) = match credential {
+            UnlockCredential::Passphrase(_) => ("passphrase-v1", ErrorCode::BadPassphrase),
+            UnlockCredential::Recovery(_) => ("recovery-v1", ErrorCode::BadPassphrase),
+            UnlockCredential::Device => ("device-v1", ErrorCode::ProviderUnavailable),
         };
         let slot = envelope
             .keyslots
             .iter()
             .find(|s| s.slot_type == kind)
-            .ok_or_else(|| AppError::new(ErrorCode::BadPassphrase))?;
+            .ok_or_else(|| AppError::new(absent))?;
         let vmk = match credential {
             UnlockCredential::Passphrase(passphrase) => {
                 keyslots::unwrap_passphrase(&envelope.vault_id, slot, passphrase)?
@@ -309,6 +333,42 @@ impl OpenVault {
             Err(error) => CleanupOutcome::Failed(Box::new(error)),
         }
     }
+    /// Decides whether a persisted device slot can still perform quick unlock.
+    ///
+    /// Three facts together prove health, and nothing less does: the stored
+    /// credential has the exact device-key length, it authenticates this slot's
+    /// envelope, and the root it unwraps is the vault's *active* master key. A
+    /// successful authenticated decryption on its own is not enough, because a
+    /// slot can authenticate under its own credential and still yield a
+    /// superseded root, which would unlock a vault whose storage keys no longer
+    /// match.
+    ///
+    /// Everything after the store read is an in-memory statement about the
+    /// credential itself, so a wrong length or a failed authentication
+    /// classifies the slot instead of failing the operation.
+    ///
+    /// # Errors
+    /// An operational credential-store failure, propagated unchanged. An outage
+    /// is never absence: treating it as one would let a transient fault destroy
+    /// a working quick unlock.
+    fn device_health(&self, vault_id: &str, slot: &Keyslot) -> Result<DeviceSlotHealth, AppError> {
+        let Some(secret) = self.credentials.retrieve(&slot.credential_ref)? else {
+            return Ok(DeviceSlotHealth::Unusable);
+        };
+        let Ok(root) = DeviceKey::from_credential(secret.as_bytes())
+            .and_then(|key| keyslots::unwrap_device(vault_id, slot, &key))
+        else {
+            return Ok(DeviceSlotHealth::Unusable);
+        };
+        // A trusted-memory comparison of derived roots, the same equality the
+        // passphrase rewrap path uses. No root or fingerprint is serialized,
+        // logged or returned.
+        if root.storage_keys()?.0.as_bytes() == self.vmk.storage_keys()?.0.as_bytes() {
+            Ok(DeviceSlotHealth::Healthy)
+        } else {
+            Ok(DeviceSlotHealth::Unusable)
+        }
+    }
     /// Changes only the authenticated header, preserving storage keys and bytes.
     ///
     /// A successful return means the replacement passphrase slot activated and
@@ -342,13 +402,19 @@ impl OpenVault {
             CleanupOutcome::NotRequired,
         ))
     }
-    /// Enrolls quick-unlock, replacing a device slot whose operating-system
-    /// credential is genuinely absent. Passphrase and recovery slots and the
-    /// VMK are untouched, so every independent path keeps working.
+    /// Enrolls quick-unlock, replacing a device slot that can no longer perform
+    /// it. Passphrase and recovery slots and the VMK are untouched, so every
+    /// independent path keeps working and the same root stays authoritative.
     ///
-    /// A device slot whose credential still exists is left alone; a credential
-    /// store that fails operationally is never treated as absence, because that
-    /// would let an outage destroy a working quick unlock.
+    /// A slot is replaceable whenever its operating-system credential cannot
+    /// unwrap the active master key — whether the credential is absent, the
+    /// wrong length, overwritten, or valid for some other vault or a superseded
+    /// root. All of those leave quick unlock broken with no other way to restore
+    /// it, and an authenticated open session is already an authorized security
+    /// boundary, so it may re-enroll. A slot whose credential does unwrap the
+    /// active master key is healthy and is deliberately not rotated. A
+    /// credential store that fails operationally is never treated as either
+    /// case, because that would let an outage destroy a working quick unlock.
     ///
     /// A successful return means the device slot activated and its credential
     /// must be retained even when durability is uncertain.
@@ -358,20 +424,23 @@ impl OpenVault {
     /// referencing a credential that was cleaned up.
     pub fn enable_device(&self) -> Committed<()> {
         let mut envelope = read_header(&self.vault.root)?;
-        let stale = match envelope
+        let replaceable = match envelope
             .keyslots
             .iter()
             .position(|s| s.slot_type == "device-v1")
         {
             None => None,
             Some(index) => {
-                let existing = envelope.keyslots[index].credential_ref.clone();
-                // An operational store failure propagates: only proven absence
-                // authorizes replacing a persisted slot.
-                if self.credentials.retrieve(&existing)?.is_some() {
-                    return Err(AppError::new(ErrorCode::CorruptHeader).into());
+                // An operational store failure propagates out of the
+                // classification: only a credential proven unable to unwrap the
+                // active root authorizes replacing a persisted slot.
+                let slot = &envelope.keyslots[index];
+                match self.device_health(&envelope.vault_id, slot)? {
+                    DeviceSlotHealth::Healthy => {
+                        return Err(AppError::new(ErrorCode::CorruptHeader).into());
+                    }
+                    DeviceSlotHealth::Unusable => Some((index, slot.credential_ref.clone())),
                 }
-                Some((index, existing))
             }
         };
         let key = DeviceKey::generate()?;
@@ -387,7 +456,7 @@ impl OpenVault {
             let cleanup = self.discard(&reference);
             return Err(NotActivated::new(primary, cleanup));
         }
-        match stale {
+        match replaceable {
             Some((index, _)) => envelope.keyslots[index] = slot,
             None => envelope.keyslots.push(slot),
         }
@@ -403,7 +472,7 @@ impl OpenVault {
         };
         // Only now, and only for a predecessor the active header no longer
         // references. A failure here leaves activation standing.
-        let cleanup = match stale {
+        let cleanup = match replaceable {
             Some((_, previous)) if previous != reference => self.discard(&previous),
             _ => CleanupOutcome::NotRequired,
         };

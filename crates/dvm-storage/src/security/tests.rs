@@ -767,7 +767,7 @@ fn stale_device_slot_is_re_enrolled_only_on_proven_absence() -> TestResult {
     let failure = active
         .enable_device()
         .err()
-        .ok_or("operational failure expected")?;
+        .ok_or("an operational credential-store failure was mistaken for absence")?;
     store.set(false, false, false);
     assert_eq!(
         failure.primary().code,
@@ -1024,6 +1024,384 @@ fn credential_reference_language_is_shared_by_keyslot_and_adapter() -> TestResul
     );
     assert!(backend.unlock(&input("original phrase")?).is_err());
     println!("D1_CREDENTIAL_REFERENCE_LANGUAGE_EQUAL=PASS");
+    Ok(())
+}
+
+/// How a persisted device credential becomes unusable while still being
+/// present in the operating-system store.
+#[derive(Debug, Clone, Copy)]
+enum Damage {
+    /// Truncated below the device-key length.
+    Short,
+    /// Extended past the device-key length.
+    Long,
+    /// Right length, wrong bytes: authentication fails.
+    Overwritten,
+    /// A real, valid device credential belonging to a different vault.
+    CrossVault,
+    /// A credential that authenticates its own slot but unwraps a superseded
+    /// root. Authenticated decryption alone would misclassify it as healthy.
+    SupersededRoot,
+}
+
+#[test]
+fn present_but_unusable_device_credential_is_re_enrolled() -> TestResult {
+    // A real device credential from a different vault: valid material, wrong
+    // vault. Built once, because it is independent of the vault under test.
+    let other = Fixture::new()?;
+    let other_store = Arc::new(MemoryStore::default());
+    let (other_backend, _) = create(&other, other_store.clone())?;
+    let other_active = other_backend.unlock(&input("original phrase")?)?;
+    other_active.enable_device()?;
+    let cross_vault = other_store
+        .retrieve(&device_reference(&other.root())?.ok_or("device slot")?)?
+        .ok_or("cross-vault credential")?
+        .as_bytes()
+        .to_vec();
+    drop(other_active);
+
+    for damage in [
+        Damage::Short,
+        Damage::Long,
+        Damage::Overwritten,
+        Damage::CrossVault,
+        Damage::SupersededRoot,
+    ] {
+        let f = Fixture::new()?;
+        let store = Arc::new(FaultStore::default());
+        let (backend, recovery) = create(&f, store.clone())?;
+        let saved_recovery = recovery.encode_for_trusted_presentation();
+        let active = backend.unlock(&input("original phrase")?)?;
+        let source = f.base.join("private device.dat");
+        fs::write(&source, b"private canonical device bytes")?;
+        let receipt = active.import(&source)?;
+        let vmk = active.vmk.storage_keys()?.0;
+        assert!(active.enable_device()?.is_fully_settled());
+        let first = device_reference(&f.root())?.ok_or("device slot")?;
+        let intact = fs::read(f.root().join("vault.header"))?;
+        let blobs = snapshot(&f.root().join("blobs"))?;
+        let db = Sha256::digest(fs::read(f.root().join("metadata.db"))?);
+        let healthy = store
+            .inner
+            .retrieve(&first)?
+            .ok_or("device credential")?
+            .as_bytes()
+            .to_vec();
+
+        // Damage the credential in place, keeping the slot and its reference
+        // exactly as the authoritative header records them. Every case below
+        // leaves an entry present, so presence alone cannot be the test.
+        let damaged = match damage {
+            Damage::Short => healthy[..31].to_vec(),
+            Damage::Long => {
+                let mut bytes = healthy.clone();
+                bytes.push(0);
+                bytes
+            }
+            Damage::Overwritten => healthy.iter().map(|b| !b).collect(),
+            Damage::CrossVault => cross_vault.clone(),
+            Damage::SupersededRoot => {
+                // A slot wrapping a different root under the same vault id and
+                // the same reference: the envelope authenticates, so only a
+                // root comparison can reject it.
+                let mut envelope = read_header(&f.root())?;
+                let index = envelope
+                    .keyslots
+                    .iter()
+                    .position(|s| s.slot_type == "device-v1")
+                    .ok_or("device slot")?;
+                let key = DeviceKey::generate()?;
+                envelope.keyslots[index] = keyslots::wrap_device(
+                    &envelope.vault_id,
+                    &VaultMasterKey::generate()?,
+                    &key,
+                    first.clone(),
+                )?;
+                fs::write(f.root().join("vault.header"), header::serialize(&envelope)?)?;
+                key.credential_bytes().to_vec()
+            }
+        };
+        store
+            .inner
+            .store(&first, &SecretValue::new(Zeroizing::new(damaged))?)?;
+        assert!(
+            store.inner.retrieve(&first)?.is_some(),
+            "{damage:?}: the damaged credential must still be present"
+        );
+        let damaged_header = fs::read(f.root().join("vault.header"))?;
+
+        // Present but unusable: quick unlock is broken, and an authenticated
+        // session is the only way to restore it.
+        assert!(
+            backend.unlock(&UnlockCredential::Device).is_err(),
+            "{damage:?}: an unusable credential unlocked the vault"
+        );
+        let outcome = active.enable_device().map_err(|e| {
+            format!(
+                "{damage:?}: a present but unusable device credential blocked re-enrollment: {e}"
+            )
+        })?;
+        assert!(
+            outcome.is_fully_settled(),
+            "{damage:?}: re-enrollment left residual work"
+        );
+        let second = device_reference(&f.root())?.ok_or("device slot")?;
+        assert_ne!(first, second, "{damage:?}: the reference was reused");
+        let header = read_header(&f.root())?;
+        assert_eq!(
+            header
+                .keyslots
+                .iter()
+                .filter(|s| s.slot_type == "device-v1")
+                .count(),
+            1,
+            "{damage:?}: exactly one device slot must remain"
+        );
+        assert_eq!(header.keyslots.len(), 3);
+        assert_eq!(
+            store.references()?,
+            vec![second.clone()],
+            "{damage:?}: credential residue remains"
+        );
+        // The same root, the same content and untouched independent slots.
+        let original = header::parse(&intact)?;
+        for kind in ["passphrase-v1", "recovery-v1"] {
+            assert!(
+                original.keyslots.iter().find(|s| s.slot_type == kind)
+                    == header.keyslots.iter().find(|s| s.slot_type == kind),
+                "{damage:?}: re-enrollment changed the {kind} slot"
+            );
+        }
+        assert!(blobs == snapshot(&f.root().join("blobs"))?);
+        assert!(db == Sha256::digest(fs::read(f.root().join("metadata.db"))?));
+
+        // The replacement unwraps the active root, so it is healthy and must
+        // not be rotated again.
+        let refused = active
+            .enable_device()
+            .err()
+            .ok_or("a healthy device slot must be refused")?;
+        assert_eq!(
+            refused.primary().code,
+            ErrorCode::CorruptHeader,
+            "{damage:?}: a healthy device slot was rotated"
+        );
+        assert_eq!(*refused.cleanup(), CleanupOutcome::NotRequired);
+        let settled = fs::read(f.root().join("vault.header"))?;
+        assert_eq!(store.references()?, vec![second.clone()]);
+
+        // An operational retrieval failure is neither absence nor damage: an
+        // outage must never rotate a slot it cannot classify.
+        store.set(false, true, false);
+        let outage = active
+            .enable_device()
+            .err()
+            .ok_or("an outage was mistaken for an unusable credential")?;
+        store.set(false, false, false);
+        assert_eq!(
+            outage.primary().code,
+            ErrorCode::ProviderUnavailable,
+            "{damage:?}: an outage was mistaken for an unusable credential"
+        );
+        assert_eq!(*outage.cleanup(), CleanupOutcome::NotRequired);
+        assert!(settled == fs::read(f.root().join("vault.header"))?);
+        assert_eq!(
+            store.references()?,
+            vec![second.clone()],
+            "{damage:?}: an outage created or destroyed a credential"
+        );
+        // Damage never became durable beyond the replacement itself.
+        assert!(damaged_header != settled);
+        drop(active);
+
+        // Every independent path still unwraps the same VMK and the same bytes.
+        for credential in [
+            input("original phrase")?,
+            UnlockCredential::Recovery(RecoverySecret::decode(saved_recovery.clone())?),
+            UnlockCredential::Device,
+        ] {
+            let reopened = backend.unlock(&credential)?;
+            assert!(
+                vmk.as_bytes() == reopened.vmk.storage_keys()?.0.as_bytes(),
+                "{damage:?}: re-enrollment changed the VMK"
+            );
+            let mut sink = Sink::default();
+            reopened.recover(&receipt.blob_id, &mut sink)?;
+            assert!(sink.committed && sink.bytes == b"private canonical device bytes");
+            drop(reopened);
+        }
+        drop(backend.unlock(&UnlockCredential::Recovery(recovery))?);
+    }
+    println!(
+        "U1_PRESENT_UNUSABLE_DEVICE_RE_ENROLLMENT=PASS U1_HEALTHY_SLOT_PRESERVED=PASS U1_RESIDUE=NONE"
+    );
+    Ok(())
+}
+
+#[test]
+fn device_unlock_without_a_device_slot_reports_provider_unavailable() -> TestResult {
+    let f = Fixture::new()?;
+    let store = Arc::new(FaultStore::default());
+    let (backend, recovery) = create(&f, store.clone())?;
+    assert!(device_reference(&f.root())?.is_none());
+    let before = snapshot(&f.root())?;
+
+    // No configured quick-unlock path is a provider-availability fact, not a
+    // failed authentication attempt against a slot that exists.
+    let failure = backend
+        .unlock(&UnlockCredential::Device)
+        .err()
+        .ok_or("device unlock must fail")?;
+    assert_eq!(
+        failure.code,
+        ErrorCode::ProviderUnavailable,
+        "a missing device slot was reported as a passphrase failure"
+    );
+    assert!(
+        before == snapshot(&f.root())?,
+        "a refused device unlock changed durable bytes or the file set"
+    );
+    assert!(
+        store.references()?.is_empty(),
+        "a refused device unlock created a credential"
+    );
+
+    // The configured paths keep their existing authentication classification.
+    drop(backend.unlock(&input("original phrase")?)?);
+    assert_eq!(
+        backend
+            .unlock(&input("wrong phrase")?)
+            .err()
+            .ok_or("must fail")?
+            .code,
+        ErrorCode::BadPassphrase
+    );
+    drop(backend.unlock(&UnlockCredential::Recovery(recovery))?);
+
+    // A vault created with recovery declined has no recovery slot, and that
+    // stays a passphrase-class authentication failure.
+    let declined = Fixture::new()?;
+    let created = ProtectedVault::create_with_policy(
+        &declined.root(),
+        &pass("original phrase")?,
+        RecoveryPolicy::DeclinedAfterDataLossWarning,
+        ArgonProfile::BASELINE,
+        Arc::new(MemoryStore::default()),
+    )
+    .map_err(NotActivated::into_primary)?
+    .into_value();
+    assert_eq!(read_header(&declined.root())?.keyslots.len(), 1);
+    assert_eq!(
+        created
+            .backend
+            .unlock(&UnlockCredential::Recovery(RecoverySecret::generate()?))
+            .err()
+            .ok_or("must fail")?
+            .code,
+        ErrorCode::BadPassphrase,
+        "a missing recovery slot changed classification"
+    );
+    assert_eq!(
+        created
+            .backend
+            .unlock(&UnlockCredential::Device)
+            .err()
+            .ok_or("must fail")?
+            .code,
+        ErrorCode::ProviderUnavailable
+    );
+    assert!(before == snapshot(&f.root())?);
+    println!("U4_MISSING_DEVICE_SLOT_CLASSIFICATION=PASS U4_NO_MUTATION=PASS");
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn post_write_persistence_failure_removes_the_credential_it_wrote() -> TestResult {
+    use crate::credentials::{WindowsCredentialStore, post_write_seam};
+    /// Disarms the seam and removes the synthetic credential however this test
+    /// leaves, including through the branch that deliberately fails its own
+    /// compensation.
+    struct Guard(String);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            post_write_seam::reset();
+            let _ = WindowsCredentialStore.delete(&self.0);
+        }
+    }
+    let reference = format!("dvm/provider/synthetic/g2-post-write-{}", Uuid::new_v4());
+    let _guard = Guard(reference.clone());
+    let canary = Zeroizing::new(format!("DVM_G2_PROVIDER_SECRET_{}", Uuid::new_v4()));
+    let secret = SecretValue::new(Zeroizing::new(canary.as_bytes().to_vec()))?;
+
+    // Control: a write whose verification passes persists and compensates nothing.
+    post_write_seam::reset();
+    WindowsCredentialStore.store(&reference, &secret)?;
+    assert!(WindowsCredentialStore.retrieve(&reference)?.is_some());
+    assert!(
+        post_write_seam::last_compensation().is_none(),
+        "a verified write removed its own credential"
+    );
+    WindowsCredentialStore.delete(&reference)?;
+
+    // Post-write verification fails after set_secret has already persisted the
+    // credential. Production must remove exactly what it just wrote.
+    post_write_seam::arm(&reference, true, false);
+    let primary = WindowsCredentialStore
+        .store(&reference, &secret)
+        .err()
+        .ok_or("post-write verification failure expected")?;
+    post_write_seam::arm(&reference, false, false);
+    assert_eq!(primary.code, ErrorCode::ProviderUnavailable);
+    assert_eq!(
+        post_write_seam::last_compensation(),
+        Some(CleanupOutcome::Completed),
+        "no compensating delete was attempted after post-write verification failed"
+    );
+    assert!(
+        WindowsCredentialStore.retrieve(&reference)?.is_none(),
+        "a credential remained after post-write verification failed"
+    );
+
+    // The same failure with a failing compensation keeps the verification
+    // failure primary and names the residue instead of hiding it.
+    post_write_seam::reset();
+    post_write_seam::arm(&reference, true, true);
+    let primary = WindowsCredentialStore
+        .store(&reference, &secret)
+        .err()
+        .ok_or("post-write verification failure expected")?;
+    post_write_seam::arm(&reference, false, false);
+    assert_eq!(
+        primary.code,
+        ErrorCode::ProviderUnavailable,
+        "a cleanup failure replaced the primary post-write verification failure"
+    );
+    let recorded = post_write_seam::last_compensation().ok_or("cleanup evidence")?;
+    assert_eq!(
+        recorded.failure().map(|e| e.code),
+        Some(ErrorCode::DiskFull),
+        "the secondary cleanup failure was discarded"
+    );
+    // A recorded cleanup failure must be real: the credential is still stored.
+    assert!(
+        WindowsCredentialStore.retrieve(&reference)?.is_some(),
+        "a recorded cleanup failure must be real"
+    );
+
+    // Neither the primary error nor the recorded secondary evidence may carry
+    // credential material or the operating-system credential reference.
+    let rendered = format!("{primary} {primary:?} {recorded:?}");
+    assert!(
+        !rendered.contains(canary.as_str()) && !rendered.contains(reference.as_str()),
+        "secret or credential reference leaked; value withheld"
+    );
+
+    WindowsCredentialStore.delete(&reference)?;
+    assert!(WindowsCredentialStore.retrieve(&reference)?.is_none());
+    println!(
+        "POST_WRITE_VERIFICATION_FAILURE_ATTEMPTS_DELETE=YES U3_PRIMARY_ERROR_PRESERVED=PASS U3_RESIDUE=NONE"
+    );
     Ok(())
 }
 

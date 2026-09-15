@@ -18,17 +18,43 @@ never drift apart. All adapter operations are serialized. Bound secrets at 2560
 bytes. Translate OS errors into canonical errors without source text. Returned backend secret buffers use
 zeroization. No new unsafe code is needed in the workspace.
 
+Writing is a write-verify-compensate transaction, not a write. `set_secret` has
+already persisted the credential by the time the persisted attributes are read
+back, so a failed post-write verification removes exactly the entry just
+written before returning. Otherwise a secret could remain stored, possibly
+under the explicitly forbidden Enterprise persistence, precisely because this
+adapter refused it. The verification failure stays primary and the removal is
+recorded beside it as non-secret secondary evidence; a failed removal never
+replaces the verification failure. The compensation is production behaviour, and
+a reference-scoped test seam reports a verification or removal failure without
+ever writing a forbidden persistence class.
+
 Provider storage exposes trusted store/retrieve/delete and a configured boolean.
 Device references contain the vault UUID and an independent random credential
 UUID, authenticated in the slot AAD; device KEKs never enter a header.
-Synthetic tests use unique targets and teardown readback. An absent credential
-disables quick-unlock without changing the header, VMK or other slots. Because
-that leaves no other way to restore quick unlock, an authenticated open session
-may replace a stale device slot: enrollment generates a new credential and slot
-wrapping the same VMK, and touches neither the passphrase nor the recovery slot.
-Only proven absence authorizes this. A credential-store read that fails
-operationally is returned as a failure, never interpreted as absence, so an
-outage cannot rotate away a working credential.
+Synthetic tests use unique targets and teardown readback. A device credential
+that cannot open its slot disables quick-unlock without changing the header, VMK
+or other slots. Because that leaves no other way to restore quick unlock, an
+authenticated open session may replace such a device slot: enrollment generates
+a new credential and slot wrapping the same VMK, and touches neither the
+passphrase nor the recovery slot.
+
+Presence of a credential is never proof that the slot works, so the
+authorization test is usability rather than absence. A slot is replaceable when
+its credential is absent, has the wrong length, fails authentication, or
+authenticates but unwraps a root other than the vault's active VMK — a
+credential copied from another vault or wrapping a superseded root is as unusable
+as a deleted one. Root identity is compared in trusted memory through the same
+derived-key equality the passphrase rewrap path uses; no root or fingerprint is
+serialized or logged. A credential that does unwrap the active VMK is healthy
+and is deliberately not rotated. A credential-store read that fails
+operationally is returned as a failure, never interpreted as absence or as
+damage, so an outage cannot rotate away a working credential.
+
+Requesting a device unlock on a vault that has no device slot reports
+`PROVIDER_UNAVAILABLE`, not `BAD_PASSPHRASE`: there is no configured quick-unlock
+path to authenticate against. Absent passphrase and recovery slots keep their
+existing authentication classification.
 
 Windows user-context credential protection does not isolate against malware
 running as that user. No network authentication or egress is introduced.
