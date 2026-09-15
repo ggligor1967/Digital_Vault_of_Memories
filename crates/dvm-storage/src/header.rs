@@ -1,4 +1,4 @@
-//! Strict versioned vault header parser/serializer; no key wrapping at G1.
+//! Strict versioned vault header parser/serializer; validates slots, wraps no keys.
 use dvm_domain::{AppError, ErrorCode, storage::VaultHeader};
 use uuid::Uuid;
 

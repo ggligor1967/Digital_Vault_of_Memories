@@ -1,4 +1,4 @@
-//! G1 native encrypted storage. No renderer commands or production keyslots.
+//! Native encrypted storage, keyslot lifecycle and OS credentials. No renderer commands.
 pub mod credentials;
 pub mod database;
 pub mod header;

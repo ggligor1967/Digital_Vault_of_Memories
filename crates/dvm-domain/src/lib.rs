@@ -49,5 +49,5 @@ pub const API_CONTRACT_VERSION: &str = "1.0.0";
 
 /// Trusted security contracts; no root secrets are renderer DTOs.
 pub mod security;
-/// Trusted G1 storage contracts.
+/// Trusted storage contracts.
 pub mod storage;

@@ -1,4 +1,4 @@
-//! Trusted G1 storage contracts. None of these types cross renderer IPC.
+//! Trusted storage contracts. None of these types cross renderer IPC.
 use crate::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -25,9 +25,9 @@ pub struct VaultHeader {
     pub hkdf: String,
     /// Required content hash.
     pub hash: String,
-    /// Future G2 container format, not a wrapping implementation.
+    /// Keyslot envelope format version, not a wrapping implementation.
     pub keyslot_format_version: u32,
-    /// Reserved, always empty at the G1 internal test boundary.
+    /// Authenticated keyslot envelopes; empty only at the internal test boundary.
     pub keyslots: Vec<crate::security::Keyslot>,
 }
 
