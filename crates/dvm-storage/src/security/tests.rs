@@ -1,7 +1,6 @@
 //! Real G2 storage/credential oracles. Only synthetic data and owned test roots.
 #![allow(clippy::too_many_lines)]
 use super::*;
-#[cfg(windows)]
 use dvm_application::provider_secrets::ProviderSecretStore;
 use dvm_application::session::VaultSession;
 use dvm_domain::security::VaultState;
@@ -65,26 +64,50 @@ fn abrupt_process_crash_header_activation_matrix() -> TestResult {
     Ok(())
 }
 
+/// Holds raw persisted bytes rather than `SecretValue`s, exactly as an
+/// operating-system store does.
+///
+/// This is what makes the invalid-stored-value class reachable at all: a mock
+/// that could only hold trusted values would classify every entry as usable by
+/// construction, and would silently agree with any implementation. Holding the
+/// bytes means this mock runs the same production classifier the real adapter
+/// does, so the two cannot disagree about what a given blob means.
 #[derive(Default)]
-struct MemoryStore(Mutex<BTreeMap<String, SecretValue>>);
-impl CredentialStore for MemoryStore {
-    fn store(&self, reference: &str, value: &SecretValue) -> Result<(), AppError> {
+struct MemoryStore(Mutex<BTreeMap<String, Zeroizing<Vec<u8>>>>);
+impl MemoryStore {
+    /// Persists bytes no `SecretValue` can hold, the way an external writer or
+    /// an earlier release could have left them.
+    fn store_raw(&self, reference: &str, bytes: Vec<u8>) -> Result<(), AppError> {
         self.0
             .lock()
             .map_err(|_| AppError::new(ErrorCode::Internal))?
-            .insert(
-                reference.into(),
-                SecretValue::new(Zeroizing::new(value.as_bytes().to_vec()))?,
-            );
+            .insert(reference.into(), Zeroizing::new(bytes));
         Ok(())
     }
-    fn retrieve(&self, reference: &str) -> Result<Option<SecretValue>, AppError> {
-        self.0
+    /// The persisted representation itself, so an oracle can assert on presence
+    /// and on exact stored length independently of how it is classified.
+    fn raw(&self, reference: &str) -> Result<Option<Vec<u8>>, AppError> {
+        Ok(self
+            .0
             .lock()
             .map_err(|_| AppError::new(ErrorCode::Internal))?
             .get(reference)
-            .map(|v| SecretValue::new(Zeroizing::new(v.as_bytes().to_vec())))
-            .transpose()
+            .map(|v| v.to_vec()))
+    }
+}
+impl CredentialStore for MemoryStore {
+    fn store(&self, reference: &str, value: &SecretValue) -> Result<(), AppError> {
+        self.store_raw(reference, value.as_bytes().to_vec())
+    }
+    fn retrieve(&self, reference: &str) -> Result<CredentialLookup, AppError> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| AppError::new(ErrorCode::Internal))?
+            .get(reference)
+            .map_or(CredentialLookup::Missing, |v| {
+                CredentialLookup::classify(Zeroizing::new(v.to_vec()))
+            }))
     }
     fn delete(&self, reference: &str) -> Result<(), AppError> {
         self.0
@@ -94,6 +117,19 @@ impl CredentialStore for MemoryStore {
         Ok(())
     }
 }
+/// The store answered and holds trusted, usable credential material.
+fn present(lookup: &CredentialLookup) -> bool {
+    matches!(lookup, CredentialLookup::Present(_))
+}
+/// The store answered and holds no entry — not merely "nothing usable".
+fn missing(lookup: &CredentialLookup) -> bool {
+    matches!(lookup, CredentialLookup::Missing)
+}
+/// The store answered and holds an entry whose contents cannot be used.
+fn invalid(lookup: &CredentialLookup) -> bool {
+    matches!(lookup, CredentialLookup::InvalidStoredValue)
+}
+
 struct Fixture {
     base: PathBuf,
 }
@@ -595,7 +631,7 @@ impl CredentialStore for FaultStore {
         }
         self.inner.store(reference, value)
     }
-    fn retrieve(&self, reference: &str) -> Result<Option<SecretValue>, AppError> {
+    fn retrieve(&self, reference: &str) -> Result<CredentialLookup, AppError> {
         if self.fail_retrieve.load(Ordering::SeqCst) {
             return Err(AppError::new(ErrorCode::ProviderUnavailable));
         }
@@ -1042,6 +1078,21 @@ enum Damage {
     /// A credential that authenticates its own slot but unwraps a superseded
     /// root. Authenticated decryption alone would misclassify it as healthy.
     SupersededRoot,
+    /// Present in the store and empty. Windows both accepts and returns a
+    /// zero-byte credential blob, so this is reachable persisted state, and it
+    /// is the one damage class no `SecretValue` can represent at all.
+    Empty,
+    /// Present in the store and longer than any credential the trusted value
+    /// admits. Unreachable on real Windows, which refuses blobs above its own
+    /// 2560-byte limit, but reachable for any store that does not.
+    Oversize,
+}
+impl Damage {
+    /// Whether the staged bytes are ones the trusted invariant rejects
+    /// outright, rather than merely useless for this slot.
+    const fn stored_value_is_invalid(self) -> bool {
+        matches!(self, Self::Empty | Self::Oversize)
+    }
 }
 
 #[test]
@@ -1054,10 +1105,8 @@ fn present_but_unusable_device_credential_is_re_enrolled() -> TestResult {
     let other_active = other_backend.unlock(&input("original phrase")?)?;
     other_active.enable_device()?;
     let cross_vault = other_store
-        .retrieve(&device_reference(&other.root())?.ok_or("device slot")?)?
-        .ok_or("cross-vault credential")?
-        .as_bytes()
-        .to_vec();
+        .raw(&device_reference(&other.root())?.ok_or("device slot")?)?
+        .ok_or("cross-vault credential")?;
     drop(other_active);
 
     for damage in [
@@ -1066,6 +1115,8 @@ fn present_but_unusable_device_credential_is_re_enrolled() -> TestResult {
         Damage::Overwritten,
         Damage::CrossVault,
         Damage::SupersededRoot,
+        Damage::Empty,
+        Damage::Oversize,
     ] {
         let f = Fixture::new()?;
         let store = Arc::new(FaultStore::default());
@@ -1081,12 +1132,7 @@ fn present_but_unusable_device_credential_is_re_enrolled() -> TestResult {
         let intact = fs::read(f.root().join("vault.header"))?;
         let blobs = snapshot(&f.root().join("blobs"))?;
         let db = Sha256::digest(fs::read(f.root().join("metadata.db"))?);
-        let healthy = store
-            .inner
-            .retrieve(&first)?
-            .ok_or("device credential")?
-            .as_bytes()
-            .to_vec();
+        let healthy = store.inner.raw(&first)?.ok_or("device credential")?;
 
         // Damage the credential in place, keeping the slot and its reference
         // exactly as the authoritative header records them. Every case below
@@ -1120,13 +1166,29 @@ fn present_but_unusable_device_credential_is_re_enrolled() -> TestResult {
                 fs::write(f.root().join("vault.header"), header::serialize(&envelope)?)?;
                 key.credential_bytes().to_vec()
             }
+            Damage::Empty => Vec::new(),
+            Damage::Oversize => vec![0x5A; 2561],
         };
-        store
-            .inner
-            .store(&first, &SecretValue::new(Zeroizing::new(damaged))?)?;
+        let damaged_length = damaged.len();
+        store.inner.store_raw(&first, damaged)?;
         assert!(
-            store.inner.retrieve(&first)?.is_some(),
+            store
+                .inner
+                .raw(&first)?
+                .is_some_and(|b| b.len() == damaged_length),
             "{damage:?}: the damaged credential must still be present"
+        );
+        // Classification is asserted directly, not only through the repair it
+        // enables: a lookup that reported absence would drive the same
+        // re-enrollment while describing the store's contents incorrectly.
+        let lookup = store.inner.retrieve(&first)?;
+        assert!(
+            if damage.stored_value_is_invalid() {
+                invalid(&lookup)
+            } else {
+                present(&lookup)
+            },
+            "{damage:?}: wrong lookup classification for a {damaged_length}-byte stored value"
         );
         let damaged_header = fs::read(f.root().join("vault.header"))?;
 
@@ -1337,7 +1399,7 @@ fn post_write_persistence_failure_removes_the_credential_it_wrote() -> TestResul
     // Control: a write whose verification passes persists and compensates nothing.
     post_write_seam::reset();
     WindowsCredentialStore.store(&reference, &secret)?;
-    assert!(WindowsCredentialStore.retrieve(&reference)?.is_some());
+    assert!(present(&WindowsCredentialStore.retrieve(&reference)?));
     assert!(
         post_write_seam::last_compensation().is_none(),
         "a verified write removed its own credential"
@@ -1359,7 +1421,7 @@ fn post_write_persistence_failure_removes_the_credential_it_wrote() -> TestResul
         "no compensating delete was attempted after post-write verification failed"
     );
     assert!(
-        WindowsCredentialStore.retrieve(&reference)?.is_none(),
+        missing(&WindowsCredentialStore.retrieve(&reference)?),
         "a credential remained after post-write verification failed"
     );
 
@@ -1385,7 +1447,7 @@ fn post_write_persistence_failure_removes_the_credential_it_wrote() -> TestResul
     );
     // A recorded cleanup failure must be real: the credential is still stored.
     assert!(
-        WindowsCredentialStore.retrieve(&reference)?.is_some(),
+        present(&WindowsCredentialStore.retrieve(&reference)?),
         "a recorded cleanup failure must be real"
     );
 
@@ -1398,7 +1460,7 @@ fn post_write_persistence_failure_removes_the_credential_it_wrote() -> TestResul
     );
 
     WindowsCredentialStore.delete(&reference)?;
-    assert!(WindowsCredentialStore.retrieve(&reference)?.is_none());
+    assert!(missing(&WindowsCredentialStore.retrieve(&reference)?));
     println!(
         "POST_WRITE_VERIFICATION_FAILURE_ATTEMPTS_DELETE=YES U3_PRIMARY_ERROR_PRESERVED=PASS U3_RESIDUE=NONE"
     );
@@ -1433,7 +1495,7 @@ fn real_windows_provider_and_device_credential_lifecycle() -> TestResult {
                 .push(reference.to_owned());
             WindowsCredentialStore.store(reference, secret)
         }
-        fn retrieve(&self, reference: &str) -> Result<Option<SecretValue>, AppError> {
+        fn retrieve(&self, reference: &str) -> Result<CredentialLookup, AppError> {
             WindowsCredentialStore.retrieve(reference)
         }
         fn delete(&self, reference: &str) -> Result<(), AppError> {
@@ -1486,9 +1548,10 @@ fn real_windows_provider_and_device_credential_lifecycle() -> TestResult {
         .lock()
         .map_err(|_| "poisoned")?
         .push(reference_device.clone());
-    let device = WindowsCredentialStore
-        .retrieve(&reference_device)?
-        .ok_or("missing device credential")?;
+    let CredentialLookup::Present(device) = WindowsCredentialStore.retrieve(&reference_device)?
+    else {
+        return Err("missing device credential".into());
+    };
     assert_eq!(device.as_bytes().len(), 32);
     drop(active);
     drop(backend.unlock(&UnlockCredential::Device)?);
@@ -1524,11 +1587,9 @@ fn real_windows_provider_and_device_credential_lifecycle() -> TestResult {
     );
     provider.delete("synthetic", &profile)?;
     assert!(!provider.configured("synthetic", &profile)?);
-    assert!(
-        WindowsCredentialStore
-            .retrieve(&reference_device)?
-            .is_none()
-    );
+    assert!(missing(
+        &WindowsCredentialStore.retrieve(&reference_device)?
+    ));
     // Error-path cleanup uses the same RAII mechanism and is independently read back.
     let cleanup_ref = format!("dvm/provider/synthetic/g2-failure-{}", Uuid::new_v4());
     {
@@ -1537,9 +1598,306 @@ fn real_windows_provider_and_device_credential_lifecycle() -> TestResult {
         };
         WindowsCredentialStore.store(&cleanup_ref, &secret)?;
     }
-    assert!(WindowsCredentialStore.retrieve(&cleanup_ref)?.is_none());
+    assert!(missing(&WindowsCredentialStore.retrieve(&cleanup_ref)?));
     println!(
         "WINDOWS_CREDENTIAL_INTEGRATION=PASS PROVIDER_SECRET_ORACLE=PASS G2_TEST_CREDENTIAL_RESIDUE=NONE"
     );
+    Ok(())
+}
+
+/// Lets an oracle keep staging into a store it has already handed to a facade
+/// that takes ownership of it.
+struct Shared<S: CredentialStore>(Arc<S>);
+impl<S: CredentialStore> CredentialStore for Shared<S> {
+    fn store(&self, reference: &str, secret: &SecretValue) -> Result<(), AppError> {
+        self.0.store(reference, secret)
+    }
+    fn retrieve(&self, reference: &str) -> Result<CredentialLookup, AppError> {
+        self.0.retrieve(reference)
+    }
+    fn delete(&self, reference: &str) -> Result<(), AppError> {
+        self.0.delete(reference)
+    }
+}
+
+/// The three lookup outcomes, and an outage, as provider-secret semantics.
+///
+/// The interesting case is the malformed stored credential. Reporting it as
+/// absent would be the comfortable answer and is the wrong one: the entry
+/// exists, a caller told "unconfigured" would overwrite state it never saw, and
+/// the corruption would never be reported. Reporting it as configured would be
+/// worse still, promising a credential that cannot be used. It must fail, and
+/// it must fail as an authentication problem rather than as an outage, because
+/// the credential service answered perfectly well.
+#[test]
+fn provider_secret_lookup_semantics() -> TestResult {
+    let inner = Arc::new(FaultStore::default());
+    let provider = ProviderSecretStore::new(Shared(Arc::clone(&inner)));
+    let reference = "dvm/provider/synthetic/g2-lookup";
+
+    // Missing: the store answered, and there is nothing there.
+    assert!(
+        !provider.configured("synthetic", "g2-lookup")?,
+        "an absent provider credential was reported as configured"
+    );
+    assert!(provider.retrieve("synthetic", "g2-lookup")?.is_none());
+
+    // Present: a credential that satisfies the trusted invariant.
+    let canary = Zeroizing::new(format!("DVM_G2_PROVIDER_SECRET_{}", Uuid::new_v4()));
+    let secret = SecretValue::new(Zeroizing::new(canary.as_bytes().to_vec()))?;
+    provider.store("synthetic", "g2-lookup", &secret)?;
+    assert!(provider.configured("synthetic", "g2-lookup")?);
+    assert!(
+        provider
+            .retrieve("synthetic", "g2-lookup")?
+            .ok_or("missing credential")?
+            .as_bytes()
+            == secret.as_bytes(),
+        "credential mismatch; redacted"
+    );
+
+    // Invalid stored value: present, unusable, and never configured.
+    for damaged in [Vec::new(), vec![0x5A; 2561]] {
+        let length = damaged.len();
+        inner.inner.store_raw(reference, damaged)?;
+        assert!(
+            invalid(&inner.retrieve(reference)?),
+            "a {length}-byte stored provider credential was not classified as unusable"
+        );
+        let configured = provider
+            .configured("synthetic", "g2-lookup")
+            .err()
+            .ok_or("a malformed provider credential was reported as absent or configured")?;
+        assert_eq!(
+            configured.code,
+            ErrorCode::ProviderAuthFailed,
+            "a malformed provider credential was not a safe authentication failure"
+        );
+        let retrieved = provider
+            .retrieve("synthetic", "g2-lookup")
+            .err()
+            .ok_or("a malformed provider credential was returned to a caller")?;
+        assert_eq!(retrieved.code, ErrorCode::ProviderAuthFailed);
+        // Neither answer may carry the offending stored representation.
+        let rendered = format!("{configured} {configured:?} {retrieved} {retrieved:?}");
+        assert!(
+            !rendered.contains("5A") && !rendered.contains("secret"),
+            "an invalid stored provider credential leaked; value withheld"
+        );
+    }
+
+    // An outage is not a verdict about the entry and must stay an outage.
+    inner.set(false, true, false);
+    let outage = provider
+        .configured("synthetic", "g2-lookup")
+        .err()
+        .ok_or("an operational store failure was swallowed")?;
+    assert_eq!(
+        outage.code,
+        ErrorCode::ProviderUnavailable,
+        "an operational store failure was reported as an authentication failure"
+    );
+    assert_eq!(
+        provider
+            .retrieve("synthetic", "g2-lookup")
+            .err()
+            .ok_or("an operational store failure was swallowed")?
+            .code,
+        ErrorCode::ProviderUnavailable
+    );
+    inner.set(false, false, false);
+
+    // Deleting the malformed entry restores the unconfigured state, so the
+    // corruption is repairable rather than terminal.
+    provider.delete("synthetic", "g2-lookup")?;
+    assert!(!provider.configured("synthetic", "g2-lookup")?);
+    println!("PROVIDER_LOOKUP_SEMANTICS=PASS");
+    Ok(())
+}
+
+/// A zero-byte device credential in the *real* Windows credential store.
+///
+/// This is the reachable corruption class that motivated the lookup
+/// classification: Windows accepts a zero-length credential blob and returns it
+/// unchanged, while no trusted value can hold one. Promoting the blob directly
+/// into a `SecretValue` turns that into a failed read, and a failed read is
+/// indistinguishable from the credential service being down — so the one repair
+/// available to an authenticated user, re-enrollment, refuses to run and the
+/// vault's quick unlock stays permanently broken.
+///
+/// The oracle is deliberately end to end and on the real store: it plants a
+/// genuine Windows credential, proves the adapter tells absence and unusability
+/// apart, and then proves the repair actually completes and preserves the vault.
+#[cfg(windows)]
+#[test]
+fn zero_length_stored_device_credential_is_classified_and_re_enrolled() -> TestResult {
+    use crate::credentials::{WindowsCredentialStore, store_raw};
+
+    /// Removes every credential this test caused to exist, on every path out.
+    struct Cleanup(Mutex<Vec<String>>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(references) = self.0.lock() {
+                for reference in references.iter() {
+                    let _ = WindowsCredentialStore.delete(reference);
+                }
+            }
+        }
+    }
+    /// The real adapter, recording what it writes so nothing outlives the test.
+    struct TrackedNative(Arc<Cleanup>);
+    impl CredentialStore for TrackedNative {
+        fn store(&self, reference: &str, secret: &SecretValue) -> Result<(), AppError> {
+            self.0
+                .0
+                .lock()
+                .map_err(|_| AppError::new(ErrorCode::Internal))?
+                .push(reference.to_owned());
+            WindowsCredentialStore.store(reference, secret)
+        }
+        fn retrieve(&self, reference: &str) -> Result<CredentialLookup, AppError> {
+            WindowsCredentialStore.retrieve(reference)
+        }
+        fn delete(&self, reference: &str) -> Result<(), AppError> {
+            WindowsCredentialStore.delete(reference)
+        }
+    }
+
+    let cleanup = Arc::new(Cleanup(Mutex::new(vec![])));
+    let f = Fixture::new()?;
+    let (backend, recovery) = create(&f, Arc::new(TrackedNative(Arc::clone(&cleanup))))?;
+    let saved_recovery = recovery.encode_for_trusted_presentation();
+    let active = backend.unlock(&input("original phrase")?)?;
+    let source = f.base.join("private device.dat");
+    fs::write(&source, b"private canonical device bytes")?;
+    let receipt = active.import(&source)?;
+    let vmk = active.vmk.storage_keys()?.0;
+    assert!(active.enable_device()?.is_fully_settled());
+    let first = device_reference(&f.root())?.ok_or("device slot")?;
+    let intact = fs::read(f.root().join("vault.header"))?;
+    let blobs = snapshot(&f.root().join("blobs"))?;
+
+    // Exactly 0 bytes, written through the same entry builder and persistence
+    // class the adapter uses, leaving the slot and its reference exactly as the
+    // authoritative header records them.
+    store_raw(&first, &[])?;
+    // Captured rather than propagated: an implementation that promotes raw
+    // bytes straight into the trusted value fails this read, and a bare `?`
+    // would report that as the test erroring rather than as the classification
+    // being wrong — which is precisely the confusion under test.
+    let lookup = WindowsCredentialStore.retrieve(&first).map_err(|e| {
+        format!(
+            "a zero-byte stored credential was not classified as an unusable stored value:              the read failed with {:?}",
+            e.code
+        )
+    })?;
+    assert!(
+        invalid(&lookup),
+        "a zero-byte stored credential was not classified as an unusable stored value"
+    );
+    // Presence is proven by contrast against the same adapter: a reference that
+    // was never written reports absence, and this one does not. The two are
+    // genuinely different answers, not one answer wearing two names.
+    let untouched = format!("dvm/device/{}", Uuid::new_v4());
+    assert!(
+        missing(&WindowsCredentialStore.retrieve(&untouched)?),
+        "an unwritten reference was not reported as absent"
+    );
+    let damaged_header = fs::read(f.root().join("vault.header"))?;
+    // Snapshotted only once the session has released the keyslot lock, so the
+    // comparison covers every file including the lock itself.
+    drop(active);
+    let before = snapshot(&f.root())?;
+
+    // An unusable credential is not a failed authentication, and it must not
+    // open the vault or change a single durable byte.
+    let refused = backend
+        .unlock(&UnlockCredential::Device)
+        .err()
+        .ok_or("a zero-byte stored credential unlocked the vault")?;
+    assert_eq!(
+        refused.code,
+        ErrorCode::ProviderUnavailable,
+        "a zero-byte stored credential was misclassified on unlock"
+    );
+    assert!(
+        before == snapshot(&f.root())?,
+        "a failed device unlock mutated the vault"
+    );
+
+    // The repair the classification exists to permit: an authenticated session
+    // replaces the unusable credential and the slot that references it.
+    let active = backend.unlock(&input("original phrase")?)?;
+    let outcome = active
+        .enable_device()
+        .map_err(|e| format!("a zero-byte stored credential blocked re-enrollment: {e}"))?;
+    assert!(
+        outcome.is_fully_settled(),
+        "zero-byte re-enrollment left residual work"
+    );
+    let second = device_reference(&f.root())?.ok_or("device slot")?;
+    assert_ne!(first, second, "the reference was reused");
+    cleanup
+        .0
+        .lock()
+        .map_err(|_| "poisoned")?
+        .push(untouched.clone());
+
+    // The replacement is a real, valid, exactly-32-byte device key.
+    let CredentialLookup::Present(replacement) = WindowsCredentialStore.retrieve(&second)? else {
+        return Err("the replacement credential is not usable".into());
+    };
+    assert_eq!(replacement.as_bytes().len(), 32);
+    // The unusable credential is no longer authoritative and leaves no residue.
+    assert!(
+        missing(&WindowsCredentialStore.retrieve(&first)?),
+        "the zero-byte credential survived re-enrollment"
+    );
+    let header = read_header(&f.root())?;
+    assert_eq!(
+        header
+            .keyslots
+            .iter()
+            .filter(|s| s.slot_type == "device-v1")
+            .count(),
+        1,
+        "exactly one device slot must remain"
+    );
+    assert_eq!(header.keyslots.len(), 3);
+    // Independent slots and stored content are untouched by the repair.
+    let original = header::parse(&intact)?;
+    for kind in ["passphrase-v1", "recovery-v1"] {
+        assert!(
+            original.keyslots.iter().find(|s| s.slot_type == kind)
+                == header.keyslots.iter().find(|s| s.slot_type == kind),
+            "re-enrollment changed the {kind} slot"
+        );
+    }
+    // Stored content is compared as blob bytes and, below, as the plaintext
+    // each credential recovers. The database file itself is not a session-stable
+    // artefact — opening and closing a SQLCipher vault rewrites it — so its
+    // bytes would be a test of SQLite, not of this repair.
+    assert!(blobs == snapshot(&f.root().join("blobs"))?);
+    assert!(damaged_header != fs::read(f.root().join("vault.header"))?);
+    drop(active);
+
+    // Every path unwraps the same master key and recovers the same bytes.
+    for credential in [
+        input("original phrase")?,
+        UnlockCredential::Recovery(RecoverySecret::decode(saved_recovery)?),
+        UnlockCredential::Device,
+    ] {
+        let reopened = backend.unlock(&credential)?;
+        assert!(
+            vmk.as_bytes() == reopened.vmk.storage_keys()?.0.as_bytes(),
+            "zero-byte re-enrollment changed the VMK"
+        );
+        let mut sink = Sink::default();
+        reopened.recover(&receipt.blob_id, &mut sink)?;
+        assert!(sink.committed && sink.bytes == b"private canonical device bytes");
+        drop(reopened);
+    }
+    drop(backend.unlock(&UnlockCredential::Recovery(recovery))?);
+    println!("U1_ZERO_LENGTH_RE_ENROLLMENT=PASS ZERO_BYTE_CREDENTIAL_RESIDUE=NONE");
     Ok(())
 }

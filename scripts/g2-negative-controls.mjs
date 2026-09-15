@@ -185,10 +185,19 @@ const cases = [
     name: 'stale-device-slot-unrecoverable',
     path: 'crates/dvm-storage/src/security.rs',
     mutate: (s) =>
-      replaceOnce(
+      replaceBlock(
         s,
-        'let Some(secret) = self.credentials.retrieve(&slot.credential_ref)? else {',
-        'let Some(secret) = self.credentials.retrieve(&slot.credential_ref).unwrap_or(None) else {',
+        [
+          '        let CredentialLookup::Present(secret) = self.credentials.retrieve(&slot.credential_ref)?',
+          '        else {',
+        ],
+        [
+          '        let CredentialLookup::Present(secret) = self',
+          '            .credentials',
+          '            .retrieve(&slot.credential_ref)',
+          '            .unwrap_or(CredentialLookup::Missing)',
+          '        else {',
+        ],
       ),
     args: [
       'test',
@@ -235,6 +244,56 @@ const cases = [
       'present_but_unusable_device_credential_is_re_enrolled',
     ],
     marker: 'a present but unusable device credential blocked re-enrollment',
+  },
+  {
+    // The START defect: raw persisted bytes promoted straight into the trusted
+    // value, so an empty stored credential — which Windows both accepts and
+    // returns — fails the read instead of being classified, and is
+    // indistinguishable from the credential service being unreachable. The
+    // repair an authenticated user is entitled to then refuses to run.
+    name: 'invalid-stored-credential-fails-the-read',
+    path: 'crates/dvm-storage/src/credentials.rs',
+    mutate: (s) =>
+      replaceBlock(
+        s,
+        [
+          '            if !persisted_locally(&entry)? {',
+          '                return Ok(CredentialLookup::InvalidStoredValue);',
+          '            }',
+          '            Ok(CredentialLookup::classify(bytes))',
+        ],
+        [
+          '            if !persisted_locally(&entry)? {',
+          '                return Err(failure());',
+          '            }',
+          '            Ok(CredentialLookup::Present(SecretValue::new(bytes)?))',
+        ],
+      ),
+    args: [
+      'test',
+      '--locked',
+      '-p',
+      'dvm-storage',
+      '--lib',
+      'zero_length_stored_device_credential_is_classified_and_re_enrolled',
+    ],
+    marker: 'a zero-byte stored credential was not classified as an unusable stored value',
+  },
+  {
+    // The comfortable wrong answer: an entry that exists but cannot be used
+    // reported as though nothing were stored. Re-enrollment would still run, so
+    // the device oracle alone cannot see it — but a caller told "unconfigured"
+    // would silently overwrite persisted state it never saw.
+    name: 'invalid-stored-value-reported-as-absent',
+    path: 'crates/dvm-domain/src/security.rs',
+    mutate: (s) =>
+      replaceOnce(
+        s,
+        'SecretValue::new(bytes).map_or(Self::InvalidStoredValue, Self::Present)',
+        'SecretValue::new(bytes).map_or(Self::Missing, Self::Present)',
+      ),
+    args: ['test', '--locked', '-p', 'dvm-storage', '--lib', 'provider_secret_lookup_semantics'],
+    marker: 'stored provider credential was not classified as unusable',
   },
   {
     // U2: a completed cleanup treated as unfinished work.

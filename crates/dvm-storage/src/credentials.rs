@@ -1,7 +1,7 @@
 //! Windows user-context generic credentials with explicit local persistence.
 use dvm_domain::{
     AppError, ErrorCode,
-    security::{CredentialStore, SecretValue, is_canonical_credential_reference},
+    security::{CredentialLookup, CredentialStore, SecretValue, is_canonical_credential_reference},
 };
 
 /// Native adapter. No ambient keyring default and no renderer-accessible interface.
@@ -126,7 +126,8 @@ pub(crate) mod post_write_seam {
 #[cfg(windows)]
 mod native {
     use super::{
-        AppError, CredentialStore, SecretValue, WindowsCredentialStore, failure, validate_reference,
+        AppError, CredentialLookup, CredentialStore, SecretValue, WindowsCredentialStore, failure,
+        validate_reference,
     };
     use dvm_domain::security::CleanupOutcome;
     use keyring_core::{Entry, api::CredentialStoreApi};
@@ -150,15 +151,30 @@ mod native {
             )
             .map_err(|_| failure())
     }
-    fn local(entry: &Entry) -> Result<(), AppError> {
-        let attributes = entry.get_attributes().map_err(|_| failure())?;
-        if !attributes
+    /// Whether Windows reports this credential as locally persisted.
+    ///
+    /// The two failure kinds are deliberately not the same value. Failing to
+    /// *query* the attributes is an outage: nothing is known, so nothing may be
+    /// concluded. A successful query that reports a persistence class this
+    /// adapter forbids is a fact about the stored entry, and the read path
+    /// turns it into a classification rather than an error.
+    /// # Errors
+    /// The attribute query itself failed.
+    fn persisted_locally(entry: &Entry) -> Result<bool, AppError> {
+        Ok(entry
+            .get_attributes()
+            .map_err(|_| failure())?
             .get("persistence")
-            .is_some_and(|p| p.eq_ignore_ascii_case("local"))
-        {
-            return Err(failure());
+            .is_some_and(|p| p.eq_ignore_ascii_case("local")))
+    }
+    /// The write path's stricter reading: anything but local persistence is a
+    /// failure to be compensated, not a value to be classified.
+    fn local(entry: &Entry) -> Result<(), AppError> {
+        if persisted_locally(entry)? {
+            Ok(())
+        } else {
+            Err(failure())
         }
-        Ok(())
     }
     /// Post-write verification of the persistence class Windows actually
     /// assigned to the credential `set_secret` has already stored.
@@ -194,6 +210,19 @@ mod native {
             *recorded = Some(cleanup);
         }
     }
+    /// Persists a raw blob the way an external writer or an earlier release
+    /// could have left one, including representations no `SecretValue` holds.
+    ///
+    /// Test-only. The production write path takes a `SecretValue` and so cannot
+    /// create an invalid entry at all, which is precisely why staging that
+    /// class in the *real* Windows store needs a seam. It writes through the
+    /// same entry builder and persistence class as `store`, so what the read
+    /// path then classifies is a genuine Windows credential, not a simulation.
+    #[cfg(test)]
+    pub(crate) fn store_raw(reference: &str, bytes: &[u8]) -> Result<(), AppError> {
+        let _guard = ACCESS.lock().map_err(|_| failure())?;
+        entry(reference)?.set_secret(bytes).map_err(|_| failure())
+    }
     impl CredentialStore for WindowsCredentialStore {
         fn store(&self, reference: &str, secret: &SecretValue) -> Result<(), AppError> {
             let _guard = ACCESS.lock().map_err(|_| failure())?;
@@ -210,16 +239,28 @@ mod native {
             }
             Ok(())
         }
-        fn retrieve(&self, reference: &str) -> Result<Option<SecretValue>, AppError> {
+        /// Classifies what Windows actually holds, before any of it is trusted.
+        ///
+        /// The raw blob never leaves this function: it is read into zeroizing
+        /// storage, judged, and either promoted to a `SecretValue` or dropped.
+        /// A blob the invariant rejects — an empty credential is the reachable
+        /// case, since Windows both accepts and returns one — is reported as an
+        /// unusable stored value, not as a failure of the credential service,
+        /// so an authenticated caller can still repair the entry.
+        fn retrieve(&self, reference: &str) -> Result<CredentialLookup, AppError> {
             let _guard = ACCESS.lock().map_err(|_| failure())?;
             let entry = entry(reference)?;
             let bytes = match entry.get_secret() {
                 Ok(value) => Zeroizing::new(value),
-                Err(keyring_core::Error::NoEntry) => return Ok(None),
+                Err(keyring_core::Error::NoEntry) => return Ok(CredentialLookup::Missing),
                 Err(_) => return Err(failure()),
             };
-            local(&entry)?;
-            Ok(Some(SecretValue::new(bytes)?))
+            // An entry exists, so a forbidden persistence class is now a
+            // property of that entry rather than a reason to fail the read.
+            if !persisted_locally(&entry)? {
+                return Ok(CredentialLookup::InvalidStoredValue);
+            }
+            Ok(CredentialLookup::classify(bytes))
         }
         fn delete(&self, reference: &str) -> Result<(), AppError> {
             let _guard = ACCESS.lock().map_err(|_| failure())?;
@@ -231,13 +272,17 @@ mod native {
     }
 }
 
+/// Test-only staging of raw persisted state; see [`native::store_raw`].
+#[cfg(all(windows, test))]
+pub(crate) use native::store_raw;
+
 #[cfg(not(windows))]
 impl CredentialStore for WindowsCredentialStore {
     fn store(&self, reference: &str, _: &SecretValue) -> Result<(), AppError> {
         validate_reference(reference)?;
         Err(failure())
     }
-    fn retrieve(&self, reference: &str) -> Result<Option<SecretValue>, AppError> {
+    fn retrieve(&self, reference: &str) -> Result<CredentialLookup, AppError> {
         validate_reference(reference)?;
         Err(failure())
     }

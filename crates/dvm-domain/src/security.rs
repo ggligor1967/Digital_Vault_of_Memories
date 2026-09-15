@@ -30,16 +30,77 @@ impl SecretValue {
     }
 }
 
+/// What a credential store found, once raw persisted bytes have been judged
+/// against the [`SecretValue`] invariant.
+///
+/// A stored credential is external input: the operating system will hand back
+/// whatever is recorded under a reference, including representations no
+/// trusted value can hold. Promoting those bytes directly into a
+/// [`SecretValue`] is what erases the distinction this type exists to keep —
+/// a rejected conversion becomes an error indistinguishable from the
+/// credential service being unreachable, and a caller that could have repaired
+/// the entry is told to give up instead.
+///
+/// Read together with the enclosing `Result`, the four outcomes are distinct:
+///
+/// * `Ok(Missing)` — the store answered; no entry exists.
+/// * `Ok(Present(_))` — the store answered; the stored value satisfies the
+///   trusted invariant.
+/// * `Ok(InvalidStoredValue)` — the store answered; an entry exists but what
+///   it holds is unusable. Repairable by re-enrollment.
+/// * `Err(_)` — the credential service itself failed. Nothing is known about
+///   the entry, so nothing may be rotated on the strength of it.
+///
+/// No `Debug` or `Serialize`, for the same reason [`SecretValue`] has neither.
+/// ```compile_fail
+/// let value: Option<dvm_domain::security::CredentialLookup> = None;
+/// serde_json::to_string(&value).unwrap();
+/// ```
+/// ```compile_fail
+/// let value: Option<dvm_domain::security::CredentialLookup> = None;
+/// format!("{value:?}");
+/// ```
+pub enum CredentialLookup {
+    /// The store answered and holds no entry under this reference.
+    Missing,
+    /// The store answered and the persisted value is trusted credential material.
+    Present(SecretValue),
+    /// The store answered and an entry exists, but its stored representation
+    /// is invalid or policy-unusable.
+    ///
+    /// Carries no payload by construction: the offending bytes are dropped,
+    /// and therefore zeroized, at the point of classification. Nothing
+    /// downstream can reach them, log them or return them.
+    InvalidStoredValue,
+}
+impl CredentialLookup {
+    /// Judges raw persisted bytes an adapter has just read from an entry that
+    /// exists.
+    ///
+    /// This is the only boundary at which untrusted stored bytes become a
+    /// trusted value. Bytes the invariant rejects are consumed here and
+    /// zeroized on drop rather than travelling any further, so an invalid
+    /// persisted credential is classified without ever being handled.
+    #[must_use]
+    pub fn classify(bytes: Zeroizing<Vec<u8>>) -> Self {
+        SecretValue::new(bytes).map_or(Self::InvalidStoredValue, Self::Present)
+    }
+}
+
 /// Trusted OS credential port; no renderer command implements this interface.
 pub trait CredentialStore: Send + Sync {
     /// Stores only in the user-scoped operating-system store.
     /// # Errors
     /// Invalid reference, unsupported platform or native write failure.
     fn store(&self, reference: &str, secret: &SecretValue) -> Result<(), AppError>;
-    /// Returns absence distinctly, never creating an entry while reading.
+    /// Classifies what is persisted, never creating an entry while reading.
+    ///
+    /// Absence, an unusable stored value and an operational failure are three
+    /// different answers; see [`CredentialLookup`].
     /// # Errors
-    /// Invalid reference or native failure.
-    fn retrieve(&self, reference: &str) -> Result<Option<SecretValue>, AppError>;
+    /// Invalid reference or native failure. Never a malformed stored value:
+    /// that is `Ok(CredentialLookup::InvalidStoredValue)`.
+    fn retrieve(&self, reference: &str) -> Result<CredentialLookup, AppError>;
     /// Idempotently removes one application-owned entry.
     /// # Errors
     /// Invalid reference or native failure.

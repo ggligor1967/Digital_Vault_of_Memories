@@ -7,8 +7,8 @@ use dvm_crypto::{
 use dvm_domain::{
     AppError, ErrorCode,
     security::{
-        Activated, ArgonProfile, CleanupOutcome, Committed, CredentialStore, HeaderDurability,
-        Keyslot, NotActivated, RecoveryPolicy, SecretValue, SessionBackend,
+        Activated, ArgonProfile, CleanupOutcome, Committed, CredentialLookup, CredentialStore,
+        HeaderDurability, Keyslot, NotActivated, RecoveryPolicy, SecretValue, SessionBackend,
     },
     storage::{ImportReceipt, ImportRepository, ReconciliationHealth, VaultHeader},
 };
@@ -293,10 +293,15 @@ impl SessionBackend for ProtectedVault {
                 keyslots::unwrap_recovery(&envelope.vault_id, slot, secret)?
             }
             UnlockCredential::Device => {
-                let secret = self
-                    .credentials
-                    .retrieve(&slot.credential_ref)?
-                    .ok_or_else(|| AppError::new(ErrorCode::ProviderUnavailable))?;
+                // A slot whose credential is absent and one whose credential is
+                // unusable both mean the same thing to an unlock attempt: there
+                // is no working quick-unlock path to try. Neither is a failed
+                // authentication, and neither may open the vault.
+                let CredentialLookup::Present(secret) =
+                    self.credentials.retrieve(&slot.credential_ref)?
+                else {
+                    return Err(AppError::new(ErrorCode::ProviderUnavailable));
+                };
                 keyslots::unwrap_device(
                     &envelope.vault_id,
                     slot,
@@ -352,7 +357,12 @@ impl OpenVault {
     /// is never absence: treating it as one would let a transient fault destroy
     /// a working quick unlock.
     fn device_health(&self, vault_id: &str, slot: &Keyslot) -> Result<DeviceSlotHealth, AppError> {
-        let Some(secret) = self.credentials.retrieve(&slot.credential_ref)? else {
+        // Absence and an unusable stored value are different facts about the
+        // store, but the same fact about this slot: quick unlock cannot work,
+        // and re-enrollment is the repair. Only an operational failure, which
+        // says nothing about the entry, is propagated instead of classified.
+        let CredentialLookup::Present(secret) = self.credentials.retrieve(&slot.credential_ref)?
+        else {
             return Ok(DeviceSlotHealth::Unusable);
         };
         let Ok(root) = DeviceKey::from_credential(secret.as_bytes())
