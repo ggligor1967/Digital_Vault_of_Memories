@@ -24,3 +24,7 @@ zeroize.workspace = true
 dvm-application.workspace = true
 dvm-observability.workspace = true
 sha2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+keyring-core.workspace = true
+windows-native-keyring-store.workspace = true

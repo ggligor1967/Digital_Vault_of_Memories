@@ -29,7 +29,8 @@
     "tauri:build:smoke": "tauri build --no-bundle",
     "runtime:evidence": "node scripts/runtime-evidence.mjs",
     "verify:g0": "node scripts/verify-g0.mjs",
-    "verify:g1": "node scripts/verify-g1.mjs"
+    "verify:g1": "node scripts/verify-g1.mjs",
+    "verify:g2": "node scripts/verify-g2.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

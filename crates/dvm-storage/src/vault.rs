@@ -200,7 +200,7 @@ impl Vault {
             .open(root.join("vault.header"))
             .map_err(|error| io_error(&error))?;
         header
-            .write_all(&crate::header::serialize(
+            .write_all(&crate::header::serialize_trusted_fixture(
                 &crate::header::injected_key_header(),
             )?)
             .map_err(|error| io_error(&error))?;
@@ -252,7 +252,7 @@ impl Vault {
             .take(16_385)
             .read_to_end(&mut bytes)
             .map_err(|error| io_error(&error))?;
-        crate::header::parse(&bytes)?;
+        crate::header::parse_trusted_fixture(&bytes)?;
         let ownership = OpenOptions::new()
             .read(true)
             .write(true)

@@ -1,128 +1,130 @@
 # Security
 
-## Current state — read this first
+## Current scope
 
-Digital Vault of Memories has closed G0 and is implementing **G1: zero-loss vault storage** through trusted Rust APIs and test-key injection. The renderer still exposes only foundation status.
+G0 and G1 are CLOSED. G2 security and key lifecycle is current; acceptance is
+recorded in [G2 evidence](docs/release-evidence/G2-SECURITY-KEY-LIFECYCLE.md).
+Implementation is not a release-readiness claim. The desktop currently exposes
+only foundation status. Production security mechanisms are trusted Rust APIs;
+there is no vault creation/recovery presentation UI.
+Argon2id uses pinned libsodium 1.0.22 through libsodium-sys-stable 1.24.0.
+The project accepts the 1.0.12/1.0.13 assessment as audit provenance for its
+Argon2id lineage; the selected 1.0.22 release and Rust adapter are not claimed to
+be independently audited. See [ADR-0007](docs/adr/ADR-0007-argon2-policy.md) for
+scope, reproducibility controls and residual lineage limitations.
 
-G1 implements encrypted storage primitives: SQLCipher, a random VMK type,
-HKDF-separated storage keys and authenticated DVB1 streaming. Acceptance status
-is recorded in G1 evidence; implementation alone is not verification. G2
-passphrase, recovery and device-key lifecycle is NOT implemented. There is no
-production vault creation/unlock UX and no persisted raw key. Do not use an
-injected-key test vault for irreplaceable data.
+## Encrypted assets and VMK protection
 
-## What G0 does establish
+SQLCipher protects private metadata, original filenames and source hints. DVB1
+XChaCha20-Poly1305 protects original bytes in bounded authenticated chunks. Blob
+names are random identifiers. Recovery requires whole-original authentication,
+length and plaintext hash equality before a transactional sink reports success.
+No normal import writes plaintext staging. G1 corruption/reconciliation semantics
+and storage key domains remain unchanged.
 
-The boundary. Blueprint v2 makes five invariants about where authority lives, and all five are decided by the structure of the code rather than by later feature work:
+An OS-random 256-bit VMK is independently wrapped by authenticated keyslots.
+Passphrases do not generate VMKs. Argon2id version 0x13 derives a wrapping KEK
+using a fresh 16-byte salt, at least 19456 KiB, 2 iterations and 1 lane. Calibration
+targets 250 ms and never goes below that baseline. Bounded persisted costs prevent
+unbounded header-driven allocation. Passphrases are exact UTF-8, without trimming
+or Unicode normalization; visually equivalent forms can differ. Empty and
+oversized passphrases are rejected. A passphrase change or KDF upgrade wraps the
+same VMK using new salt/nonce, without re-encrypting canonical data.
 
-| Invariant | Statement                                                  | How G0 holds it                                                                          |
-| --------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| INV-011   | The renderer never receives vault keys or provider secrets | G1 keys stay in Rust; IPC still carries only foundation versions and health              |
-| INV-012   | The renderer has no arbitrary shell execution              | The window's capability grants no plugin permissions; no shell plugin is a dependency    |
-| INV-013   | The renderer has no arbitrary host filesystem access       | As above; no filesystem plugin is a dependency, and the renderer may not import `node:*` |
-| INV-014   | Remote egress is explicit and scoped                       | No network dependency exists; the production CSP permits no remote origin                |
-| INV-015   | Locked vault content is unreachable through IPC            | G1 storage has no IPC surface; the command surface remains foundation status             |
+Default creation generates a separate 256-bit random recovery credential. A
+trusted caller may explicitly acknowledge declining recovery after a data-loss
+warning. Recovery uses domain-separated HKDF and an independent authenticated
+slot; it survives passphrase changes. Recovery material is never persisted by
+DVM or sent to the renderer. A future trusted presentation design must preserve
+this boundary. Losing all unlock credentials permanently loses access.
 
-These are enforced mechanically, not by review:
+Every slot authenticates its type, version, ID, algorithm/KDF fields, salt,
+nonce, vault ID and device reference using deterministic versioned AAD. Unknown
+mandatory formats fail closed. Empty keyslots are reserved for explicitly named
+G1 injected-key fixtures and are rejected by production admission.
 
-- `tests/security/src/capabilities.test.ts` reads every capability file and fails on any filesystem, shell, process or HTTP permission, on any wildcard, and on any legacy Tauri 1 allowlist pattern.
-- `tests/security/src/csp.test.ts` fails if the production policy gains `unsafe-eval`, an inline script source, a remote origin or a CDN — and separately fails if the development policy adds any source the repository has not recorded a reason for.
-- `tests/security/src/dependency-scope.test.ts` reads every `package.json` and `Cargo.toml` and fails if a dependency belonging to a later gate appears, including any AI or model-provider package.
-- `tests/security/src/architecture.test.ts` fails if any renderer module other than the single IPC adapter imports Tauri, if any renderer module imports a Node built-in, or if a React component calls `invoke` directly.
+## Optional device and provider credentials
 
-They run on `pnpm test`, on `pnpm verify:g0`, and in CI on Windows.
+Quick-unlock is disabled by default. Enabling it generates a separate random
+32-byte device KEK and stores it in Windows Credential Manager as a generic
+credential with explicit Local persistence: the same Windows user on the same
+computer, without Enterprise roaming semantics. Only its non-secret reference
+is in the header. A missing/deleted credential disables this path while leaving
+passphrase and recovery usable. It never creates a replacement VMK.
 
-## The trust boundary
+Provider credentials also use only this native OS store through a backend-only
+`ProviderSecretStore`. Its public status is configured/not-configured; raw values
+are never IPC responses or stored in SQLCipher, settings, localStorage or logs.
+References follow `dvm/provider/<provider>/<profile>`. There is no provider SDK,
+remote provider call or new egress authority. Windows user-context protection
+does not protect against malicious software running as that same user.
 
-```text
-React renderer  ── untrusted ──►  typed Tauri command  ──►  Rust  ── trusted ──►  OS
-```
+## Session and renderer boundary
 
-The renderer owns presentation and nothing else. It has no database connection, no file handle, no credential and no network client. Anything it needs from the machine, it asks for by name through a typed command that validates its input in Rust.
+The typed state model is CLOSED → LOCKED → UNLOCKING → OPEN, with failed unlock
+returning LOCKED. OPEN → LOCKING → LOCKED drops the live storage/key owner.
+Unhealthy storage changes admission to DEGRADED_READ_ONLY. Every application
+content operation requires OPEN and holds the same synchronization guard as lock.
+Wrong credentials are rejected before database opening or reconciliation. Tests
+compare durable file sets/hashes, not just the returned error.
 
-Concretely, at G0:
+The session owns the one active VMK/storage lifetime. Secret types do not
+implement Serialize or exposing Debug. Releasable secret buffers use zeroization;
+compiler/register/OS copies and storage-engine internals cannot all be proven
+absent from process memory.
 
-- `apps/desktop/src-tauri/capabilities/main-window.json` declares `"permissions": []`. The window is granted no Tauri plugin capability whatsoever. Application-defined commands remain reachable, which is exactly the intended surface.
-- `withGlobalTauri` is `false`, so no ambient `window.__TAURI__` object exists.
-- `freezePrototype` is `true`.
-- The asset protocol is disabled with an empty scope.
+The WebView receives no VMK, DB key, BlobRootKey, device KEK, recovery material or
+provider credential. Its capability grants zero plugin permissions. There is no
+generic filesystem, shell, process, credential getter or HTTP command. The only
+registered IPC operation is foundation status, so it cannot query private content
+in any state. Production CSP has no remote script/provider origin or unsafe-eval.
+Development HMR permissions are separately asserted.
 
-## Content Security Policy
+## Diagnostics and evidence
 
-Production (`app.security.csp`):
+Diagnostic field values are public only for exact supported status, contract
+version and error-code values. All other fields are redacted; unknown event and
+field names are replaced. Error detail construction accepts only a fixed public
+operational message or a redacted marker. The legacy structural sanitizer is not
+used as secret classification. Native errors are converted without their source
+text. Original names, private path components and secret material must not enter
+logs, IPC failure envelopes or evidence.
 
-```text
-default-src 'self'; script-src 'self'; style-src 'self';
-img-src 'self' asset: data: blob:; font-src 'self';
-media-src 'self' asset: blob:;
-connect-src 'self' ipc: http://ipc.localhost;
-worker-src 'self'; manifest-src 'self';
-object-src 'none'; base-uri 'none'; frame-src 'none';
-frame-ancestors 'none'; form-action 'none'
-```
+Diagnostics use stdout and the explicitly configured `DVM_G0_DIAGNOSTICS_FILE`
+sink. G2 tests use synthetic canaries, secret-safe assertions and uniquely named
+OS credentials with cleanup/readback. Evidence scanning is limited to generated
+G2 output, never arbitrary user data. No real API keys are used in tests.
 
-`http://ipc.localhost` is Tauri's loopback IPC origin on Windows, not a network destination. Every asset is bundled locally, so no CDN or font host appears anywhere.
+## Threat model and remaining limitations
 
-Development (`app.security.devCsp`) has the following five source additions across four directives, each recorded in `tests/security/src/csp.test.ts`; unrecorded additions fail the test:
+The [threat model](docs/threat-model/THREAT-MODEL.md) maps in-scope threats to
+controls and test obligations. Confidentiality is not guaranteed against malware
+with equal/higher privilege while OPEN, a compromised OS, active process-memory
+inspection, voluntary export/disclosure or loss of passphrase and all recovery
+material. DVM does not claim resistance to a fully compromised host.
 
-| Directive     | Development addition    | Why                                                                                                                                                                      |
-| ------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `style-src`   | `'unsafe-inline'`       | Vite injects styles as inline `<style>` elements during hot module replacement. The production bundle emits a static stylesheet, so production keeps `style-src 'self'`. |
-| `connect-src` | `ws://localhost:5173`   | The Vite HMR websocket. There is no dev server in production.                                                                                                            |
-| `connect-src` | `http://localhost:5173` | Vite module and asset requests during development.                                                                                                                       |
-| `font-src`    | `data:`                 | Vite may inline fonts as data URLs before the production asset pipeline runs.                                                                                            |
-| `worker-src`  | `blob:`                 | Vite dependency pre-bundling can create blob workers in development.                                                                                                     |
+Atomic same-directory header replacement protects against tested process crashes.
+It does not certify arbitrary hardware power loss or filesystems that violate
+flush/rename semantics. Without an external monotonic anchor, a complete older
+header can be replayed. KDF costs slow offline guesses but do not rate-limit an
+attacker with copied vault files. File sizes and non-secret header metadata remain
+visible. Recovery credentials cannot recreate deleted content.
 
-Neither policy permits `'unsafe-eval'`, and neither permits an inline script source. A separate test asserts that the development policy never _removes_ a production restriction, so "it only works in dev" can never be resolved by loosening production.
+An abrupt crash during optional device enrollment can leave an unreferenced OS
+credential because the OS store and header cannot activate atomically together.
+This does not remove the independent passphrase/recovery paths. Header crash
+tests use an in-memory credential store; real OS tests explicitly clean up.
 
-## The error envelope
+G3 backup, restore and migration are not implemented. Search, AI/networking,
+media pipelines, plugins, mobile, sync and release hardening remain later gates.
+Dependency scans, SBOM, signing and coordinated disclosure are G6 requirements.
 
-Failures cross the IPC boundary as the canonical envelope of Blueprint v2 §23.1:
+## Reporting and licence
 
-```rust
-AppError { code, message_key, retryable, correlation_id, safe_details? }
-```
+There is no published release or established coordinated-disclosure process.
+Raise concerns in the repository issue tracker without posting secrets or private
+vault data. G6 must establish a disclosure contact and response commitments.
 
-There is deliberately no field that can carry a stack trace, a source-error chain, an absolute path or a secret. `message_key` is a localisation key rather than prose, so the backend never embeds interpolated internal data in a user-visible string. `safe_details` passes through an allow-list filter that keeps only ASCII letters, digits and a small punctuation set, which removes structural separators but does not redact private words. G1 errors therefore use code-only constructors and never populate details from source paths, filenames or keys. Anything the backend needs to keep for diagnosis stays local and is correlated through `correlation_id`.
-
-The renderer normalises any rejection that is _not_ a well-formed envelope — a transport failure, an unregistered command, an unparseable payload — to `INTERNAL` and carries no detail across, because it has no way to know that detail is safe.
-
-## Diagnostics
-
-`crates/dvm-observability` emits single-line JSON events with a fixed event name and a small set of string fields, each passed through the same allow-list filter. There is no free-form payload. G0 emits exactly two events: `foundation_status_served` and `desktop_shell_start_failed`.
-
-Diagnostics go to standard output, and additionally to a file when the `DVM_G0_DIAGNOSTICS_FILE` environment variable names one. That file sink exists because a Windows release build runs under the `windows` subsystem with no attached console, so the runtime-evidence procedure needs a reliable capture channel. Nothing writes anywhere the caller did not name.
-
-## Dependency and licence scanning
-
-Blueprint v2 §30 sets supply-chain policy, and `Gates.yaml` assigns the mandatory `dependency_scans`, `license_scan` and `sbom` requirements to **gate G6**, not to G0. G0 therefore does not introduce a scanning stack, and no scan result is a G0 blocker.
-
-What G0 does instead is keep the attack surface small enough to reason about: exact pinned versions everywhere, both lockfiles committed, no dependency lifecycle scripts enabled (`onlyBuiltDependencies: []`), and a test that fails if a later-gate dependency appears early.
-
-## Reporting a vulnerability
-
-The project has no published release and no users, so there is no coordinated-disclosure process yet. Until one exists, raise security concerns the same way as any other defect, through the repository's issue tracker, and say clearly in the title that the issue is security-related.
-
-When the project reaches gate G6 this section is replaced by a real disclosure policy with a contact address and response commitments, as Blueprint v2 §29 requires before any release.
-
-## Licence
-
-No licence has been chosen. Until one is, the work is under exclusive copyright of its contributors and grants no redistribution rights. Choosing a licence is a prerequisite for the first release, not for G0.
-
-## G1 data handling
-
-Original names and source hints are written solely to encrypted metadata. Blob
-and staging names are random identifiers. The typed storage_failure diagnostic
-emits only an error code, ignoring even safe_details. G0's character sanitizer
-is not treated as a content-redaction mechanism. Private-path regression tests
-exercise the real failing import path and serialized diagnostic output.
-
-DVB1 consumers receive provisional chunks through a transactional sink. Whole
-original success requires authenticated header/frames, declared length, EOF and
-stored hash equality. Failed reads abort provisional output. No normal import
-creates a plaintext staging copy. Originals are never rewritten by jobs.
-
-Process-crash tests exist only in cfg(test); no release environment variable
-triggers process termination. Reconciliation quarantines ambiguous data rather
-than deleting it. Corrupt/missing originals prevent normal writes and mark items
-CORRUPTED. These are process-restart tests, not hardware power-failure certification.
+No licence has been chosen. Until one is, the work is under exclusive copyright
+of its contributors and grants no redistribution rights. Choosing a licence is a
+prerequisite for the first release.

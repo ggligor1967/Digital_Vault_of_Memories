@@ -2,7 +2,8 @@
  * Scope assertions: the foundation must not have quietly acquired a
  * later-gate dependency.
  *
- * G1 permits its explicitly selected native storage and crypto dependencies.
+ * Each open gate permits only its explicitly selected native storage and crypto
+ * dependencies.
  * Other storage stacks and future-gate dependencies remain rejected. These
  * tests read every manifest in the repository and fail if such a dependency
  * appears without the corresponding gate having been opened.
@@ -20,17 +21,15 @@ import { readRepoFile, readRepoJson, walkFiles } from './repository.ts';
  * reviewable decision rather than an unnoticed `pnpm add`.
  */
 const LATER_GATE_DEPENDENCIES: { fragment: string; gate: string }[] = [
-  // Unselected storage stacks remain forbidden even though G1 is current.
+  // Unselected storage stacks remain forbidden even though G1 is open.
   { fragment: 'sqlx', gate: 'G1' },
   { fragment: 'diesel', gate: 'G1' },
   { fragment: 'sql.js', gate: 'G1' },
   { fragment: 'better-sqlite3', gate: 'G1' },
   { fragment: 'tauri-plugin-sql', gate: 'G1' },
   // G2 — cryptography and secret storage
-  { fragment: 'argon2', gate: 'G2' },
   { fragment: 'aes-gcm', gate: 'G2' },
   { fragment: 'ring', gate: 'G2' },
-  { fragment: 'keyring', gate: 'G2' },
   { fragment: 'tauri-plugin-stronghold', gate: 'G2' },
   // G3 — backup
   { fragment: 'zip', gate: 'G3' },
@@ -105,10 +104,12 @@ function cargoDependencyNames(): { manifest: string; name: string }[] {
       const line = rawLine.trim();
 
       if (line.startsWith('[')) {
-        inDependencySection = /^\[(workspace\.)?(build-|dev-)?dependencies\]$/.test(line);
-        const tableMatch = /^\[(workspace\.)?(build-|dev-)?dependencies\.([A-Za-z0-9_-]+)\]$/.exec(
-          line,
-        );
+        inDependencySection =
+          /^\[(?:target\..+\.)?(workspace\.)?(build-|dev-)?dependencies\]$/.test(line);
+        const tableMatch =
+          /^\[(?:target\..+\.)?(workspace\.)?(build-|dev-)?dependencies\.([A-Za-z0-9_-]+)\]$/.exec(
+            line,
+          );
         if (tableMatch?.[3]) {
           found.push({ manifest, name: tableMatch[3] });
         }
@@ -151,7 +152,7 @@ describe('dependency scope', () => {
     for (const { manifest, name } of allDependencies) {
       for (const { fragment, gate } of LATER_GATE_DEPENDENCIES) {
         if (matchesFragment(name, fragment)) {
-          violations.push(`${manifest}: "${name}" is ${gate} scope, but G1 is the current gate`);
+          violations.push(`${manifest}: "${name}" is ${gate} scope, but G2 is the current gate`);
         }
       }
     }
@@ -217,11 +218,9 @@ describe('reserved crates', () => {
   });
 });
 
-describe('G1 storage boundary', () => {
+describe('native storage boundary', () => {
   it('keeps future-gate detection active for representative prohibited dependencies', () => {
     for (const name of [
-      'argon2',
-      'keyring',
       'hnsw',
       'tantivy',
       'openai',
@@ -253,7 +252,7 @@ describe('G1 storage boundary', () => {
     }
   });
 
-  it('keeps G1 out of renderer commands and preserves future workspace placeholders', () => {
+  it('keeps vault operations and key material out of the renderer and preserves future workspace placeholders', () => {
     const commands = readRepoFile('apps/desktop/src-tauri/src/lib.rs');
     expect(commands).not.toMatch(/vault_create|vault_unlock|import_paths/);
     for (const path of walkFiles('apps/desktop/src').filter(

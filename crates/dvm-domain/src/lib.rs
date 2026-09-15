@@ -47,5 +47,7 @@ pub use foundation::{FoundationHealth, FoundationStatus};
 /// against differs from the value the trusted backend reports.
 pub const API_CONTRACT_VERSION: &str = "1.0.0";
 
-/// Trusted G1 storage contracts.
+/// Trusted security contracts; no root secrets are renderer DTOs.
+pub mod security;
+/// Trusted storage contracts.
 pub mod storage;

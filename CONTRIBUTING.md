@@ -2,11 +2,19 @@
 
 ## The one rule that shapes everything else
 
-Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. G0 is closed. The current gate is **G1 — zero-loss vault storage**.
+Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. G0 and G1 are CLOSED. The current gate is **G2 — security and key lifecycle**.
 
 This is not process for its own sake. Blueprint v2 replaced an architecture that made guarantees it could not keep, and it did so by ordering the work so that correctness, security and recoverability are proven _before_ the features that depend on them. A change that implements part of G1 while G0 is open does not accelerate anything; it removes the evidence that G0 was ever true.
 
-G1 authorizes native SQLCipher, SQLite access, XChaCha20-Poly1305, HKDF, SHA-256, OS randomness, zeroization and storage correctness/testing dependencies only. Argon2, keyring, AI/model providers, HNSW/search, FFmpeg/media, backup/archive and plugin frameworks remain prohibited.
+G2 additionally authorizes the exactly pinned Argon2id and native Windows credential adapters documented in ADR-0006 through ADR-0009. AI/model providers, HNSW/search, FFmpeg/media, backup/archive and plugin frameworks remain prohibited. Provider-secret storage grants no network authority.
+
+Before direct Cargo commands, run `node scripts/prepare-sodium.mjs` on Windows x64.
+All repository gates run this prerequisite automatically. It verifies the pinned
+libsodium 1.0.22 archive and static library; no global installation is needed.
+The binding's archive/download build dependencies are native build tooling only.
+Normal application dependencies gain no archive or networking API. RustCrypto
+Argon2 is disqualified; ADR-0007 records the accepted libsodium audit lineage and
+the confined private FFI exception to the otherwise enforced unsafe-code ban.
 
 `tests/security/src/dependency-scope.test.ts` enforces this mechanically. Adding a later-gate dependency fails the build with the gate name in the message.
 
@@ -37,7 +45,7 @@ Toolchain versions are pinned in `.node-version`, the `packageManager` field, an
 ## Before you push
 
 ```powershell
-pnpm verify:g0
+pnpm verify:g2
 ```
 
 That runs every gate check in order and prints each command with its exact exit code. It is the same script CI runs, so a green run locally means a green run in CI for everything except the platform matrix.
@@ -95,17 +103,30 @@ Two rules about evidence are worth stating plainly, because both are easy to vio
 - **Screenshots are not evidence** for storage, security or recovery correctness. They can supplement a command transcript; they cannot replace one.
 - **A successful compile is not runtime proof.** Where a gate requires runtime behaviour, it requires a captured, mechanical observation of that behaviour — for G0, that is `pnpm runtime:evidence`.
 
-Do not report `PASS` for a step you skipped. `pnpm verify:g0` reports skipped steps as skipped for exactly this reason.
+Do not report `PASS` for a step you skipped. `pnpm verify:g2` reports skipped steps as skipped for exactly this reason.
 
-## G1 acceptance
+## Closed G1 acceptance history
 
 Run `pnpm verify:g1` before a candidate commit. Tests must use real SQLCipher,
 DVB1 originals, restart equality, transactional failure injection and child-process
 crashes at C1–C8. Returned errors alone are not crash evidence. The >2 GiB test is
 mandatory locally and in the clean room. Never count a skipped gate as PASS.
 No renderer permission expansion, production empty-keyslot vault creation, raw
-key persistence or G2 features are authorized. Keep all direct dependencies exact.
+key persistence or G2 features were authorized by that G1 transaction. Keep all direct dependencies exact.
 
 The single final G1 commit protocol verifies a candidate SHA in a fresh short-path
 checkout, then amends only its evidence document. Source changes invalidate that
 clean-room result. Do not merge the G1 PR in the implementation transaction.
+
+## G2 security evidence
+
+Use only synthetic credentials and unique application-owned test namespaces.
+Never record passphrases, recovery material, raw keys or provider credentials in
+logs, snapshots or assertions. Compare secret identity in memory and report only
+booleans. New secret types must fail independent Serialize and Debug compile
+oracles. Recovery defaults to generation; a deliberate decline is a typed trusted
+API decision. A renderer presentation workaround is not authorized.
+
+Candidate publication requires local and exact-source clean-room PASS. After
+clean-room proof, only the evidence document may be amended before publication.
+G2 must not be merged or advance G3 in the implementation transaction.

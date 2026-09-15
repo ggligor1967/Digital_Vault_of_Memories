@@ -2,15 +2,21 @@
 
 A local-first desktop application for importing, preserving, organising, searching and exporting personal digital memories — photographs, videos, audio, documents and text — with the original bytes treated as more important than anything derived from them.
 
-**Status: G0 closed; G1 — zero-loss vault storage is current. This is not yet a usable product.**
+**Status: G0 CLOSED; G1 CLOSED; G2 security and key lifecycle is current. G2 acceptance is pending. This is not yet a usable product.**
 
-The application currently starts, shows the version of its renderer and of its trusted Rust backend, and confirms that the two agree on the IPC contract. G1 adds trusted Rust storage APIs and injected-key integration tests. There is no production vault creation/unlock, passphrase/recovery/device key lifecycle, search or AI. Those arrive gate by gate, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36, and none of them may be started before the gate they belong to is authorised.
+The desktop shell currently exposes only foundation status. Trusted Rust APIs now
+implement production passphrase/recovery/device keyslots and a guarded vault
+session. Recovery material stays in the trusted Rust boundary; presentation UI
+requires a future security decision. No content or credential getter is exposed
+through renderer IPC. G3 backup/restore/migration and G4+ features are not started.
+See the [G2 threat model](docs/threat-model/THREAT-MODEL.md) and
+[G2 evidence](docs/release-evidence/G2-SECURITY-KEY-LIFECYCLE.md) for verified scope.
 
 | Gate   | Scope                                                                                     | State       |
 | ------ | ----------------------------------------------------------------------------------------- | ----------- |
 | **G0** | Repository foundation: workspace, lockfiles, Tauri 2 shell, typed IPC, error envelope, CI | **closed**  |
-| **G1** | Zero-loss vault storage                                                                   | **current** |
-| G2     | Security and key lifecycle                                                                | not started |
+| **G1** | Zero-loss vault storage                                                                   | **closed**  |
+| G2     | Security and key lifecycle                                                                | **current** |
 | G3     | Recovery, backup, migration                                                               | not started |
 | G4     | Deterministic search                                                                      | not started |
 | G5     | AI provider layer                                                                         | not started |
@@ -185,7 +191,7 @@ G1 implements SQLCipher metadata, authenticated DVB1 originals, streaming import
 canonical dedup, durable verification jobs, and startup reconciliation through
 trusted Rust APIs. The UI remains the G0 status shell. Injected test VMKs are
 never persisted; an internal test vault with empty keyslots is not a production
-vault. G2 remains NOT STARTED.
+vault. G2 adds the independently verified production keyslot boundary.
 
 Windows builds require native Strawberry Perl (verified here: 5.42.3.1), in PATH,
 for bundled OpenSSL. Git's MSYS Perl is not the native MSVC build prerequisite.
@@ -211,3 +217,12 @@ a shutdown margin and removes only its own generated fixtures.
 
 See ADR-0002 through ADR-0005 and
 [the G1 evidence record](docs/release-evidence/G1-ZERO-LOSS-VAULT-STORAGE.md).
+
+## G2 acceptance
+
+Run `pnpm verify:g2` on Windows. It composes the unchanged G0/G1 gates, security
+oracles, native Windows credentials and production build. `--cleanroom` requires
+the full local path; `--ci` preserves the explicit inherited G1 interactive and
+multi-GB CI exclusions while requiring real Windows credential tests. No local
+G2 acceptance may skip a mandatory test. Test credentials are synthetic and
+uniquely named. The gate prepends installed Strawberry Perl only for its children.

@@ -10,8 +10,8 @@
 //! # Design constraints honoured here
 //!
 //! * **Allow-list, not deny-list.** A [`DiagnosticEvent`] can only carry a
-//!   fixed event name and a small set of string fields, each of which is run
-//!   through the same conservative filter used by the error envelope. There is
+//!   fixed event name and a small set of string fields, whose values
+//!   must match fixed public classifications; all other fields are redacted. There is
 //!   no free-form payload for a caller to put a path or a secret into.
 //! * **No ambient sinks.** The crate writes to standard output and, when a
 //!   sink path is supplied by the caller, appends one JSON object per line to
@@ -39,7 +39,7 @@ const MAX_FIELD_LEN: usize = 120;
 
 /// A structured diagnostic event.
 ///
-/// Field values are sanitised on insertion, so an event that has been
+/// Non-public field values are replaced on insertion, so an event that has been
 /// constructed is safe to write anywhere the process can already write.
 #[derive(Debug, Clone)]
 pub struct DiagnosticEvent {
@@ -52,28 +52,48 @@ pub struct DiagnosticEvent {
 impl DiagnosticEvent {
     /// Starts an event with the given name.
     ///
-    /// The name is sanitised like any other value; a caller cannot smuggle
-    /// data out through it.
+    /// Only established public event names survive; unknown names are redacted.
     #[must_use]
     pub fn new(event: &str) -> Self {
         Self {
-            event: sanitise(event).unwrap_or_else(|| "unnamed".to_owned()),
+            event: match event {
+                "foundation_status_served"
+                | "desktop_shell_start_failed"
+                | "storage_failed"
+                | "security_test"
+                | "e"
+                | "real" => event,
+                _ => "redacted_event",
+            }
+            .to_owned(),
             fields: Map::new(),
         }
     }
 
-    /// Adds a sanitised string field.
+    /// Adds a field whose value is public only for an exact allowlisted classification.
     ///
     /// A value that sanitises away entirely is recorded as `"redacted"` rather
     /// than being dropped, so the shape of an event never depends on its
     /// content.
     #[must_use]
     pub fn with_field(mut self, key: &str, value: &str) -> Self {
-        let Some(key) = sanitise(key) else {
-            return self;
+        let field = match key {
+            "contract_version" | "status" | "error_code" | "reason" | "secret" | "source"
+            | "endpoint" | "event" => key,
+            _ => "redacted_field",
         };
-        let value = sanitise(value).unwrap_or_else(|| "redacted".to_owned());
-        self.fields.insert(key, Value::String(value));
+        let public = match key {
+            "contract_version" => value == dvm_domain::API_CONTRACT_VERSION,
+            "status" => matches!(value, "ok" | "degraded"),
+            "error_code" => dvm_domain::ErrorCode::ALL
+                .iter()
+                .any(|c| c.as_wire_str() == value),
+            _ => false,
+        };
+        self.fields.insert(
+            field.to_owned(),
+            Value::String(if public { value } else { "redacted" }.to_owned()),
+        );
         self
     }
 
@@ -199,6 +219,44 @@ mod tests {
     use super::{DiagnosticEvent, MAX_FIELD_LEN, sanitise};
 
     #[test]
+    fn g2_secret_canaries_cannot_cross_logging_diagnostics_or_ipc() {
+        for label in [
+            "passphrase",
+            "recovery",
+            "vmk",
+            "passphrase-kek",
+            "recovery-kek",
+            "device-kek",
+            "db-key",
+            "blob-root",
+            "provider-secret",
+        ] {
+            let error = dvm_domain::AppError::new(dvm_domain::ErrorCode::Internal);
+            let canary = format!("DVM_G2_{label}_{}", error.correlation_id);
+            let envelope = error.with_safe_details(&canary);
+            let diagnostics = DiagnosticEvent::new("security_test").with_field("secret", &canary);
+            let outputs = [
+                envelope.to_string(),
+                format!("{envelope:?}"),
+                serde_json::to_string(&envelope).expect("error DTO"),
+                diagnostics.to_json_line(),
+                format!("{diagnostics:?}"),
+                DiagnosticEvent::new(&canary)
+                    .with_field(&canary, &canary)
+                    .to_json_line(),
+                super::storage_failure(&envelope).to_json_line(),
+            ];
+            for output in outputs {
+                assert!(
+                    !output.contains(&canary),
+                    "secret redaction failed; value withheld"
+                );
+            }
+            let _outcome = diagnostics.emit();
+        }
+    }
+
+    #[test]
     fn an_event_renders_as_one_json_line_with_event_first() {
         let line = DiagnosticEvent::new("foundation_status_served")
             .with_field("contract_version", "1.0.0")
@@ -230,8 +288,8 @@ mod tests {
         assert!(!line.contains('\\'), "path separators must not survive");
         assert!(!line.contains("C:"), "drive letters must not survive");
         assert!(
-            line.contains("photo.jpg"),
-            "plain words are expected to survive; the sanitiser removes structure, not content"
+            !line.contains("photo.jpg"),
+            "G2 redacts private components, not just path separators"
         );
     }
 
@@ -268,12 +326,12 @@ mod tests {
     }
 
     #[test]
-    fn a_key_that_sanitises_away_is_dropped() {
+    fn a_key_that_is_not_allowlisted_becomes_the_redacted_field_key() {
         let line = DiagnosticEvent::new("e")
             .with_field("///", "value")
             .to_json_line();
 
-        assert_eq!(line, r#"{"event":"e"}"#);
+        assert_eq!(line, r#"{"event":"e","redacted_field":"redacted"}"#);
     }
 
     #[test]

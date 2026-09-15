@@ -1,4 +1,4 @@
-//! Strict versioned vault header parser/serializer; no key wrapping at G1.
+//! Strict versioned vault header parser/serializer; validates slots, wraps no keys.
 use dvm_domain::{AppError, ErrorCode, storage::VaultHeader};
 use uuid::Uuid;
 
@@ -24,6 +24,15 @@ pub fn injected_key_header() -> VaultHeader {
 /// # Errors
 /// `CORRUPT_HEADER` for malformed data; unsupported versions fail before any write.
 pub fn parse(bytes: &[u8]) -> Result<VaultHeader, AppError> {
+    let header = parse_trusted_fixture(bytes)?;
+    validate_production(&header)?;
+    Ok(header)
+}
+
+/// G1 injected-key compatibility boundary. Never use as production admission.
+/// # Errors
+/// Invalid or unsupported envelope.
+pub fn parse_trusted_fixture(bytes: &[u8]) -> Result<VaultHeader, AppError> {
     if bytes.len() > 16_384 {
         return Err(AppError::new(ErrorCode::CorruptHeader));
     }
@@ -37,6 +46,14 @@ pub fn parse(bytes: &[u8]) -> Result<VaultHeader, AppError> {
 /// # Errors
 /// Rejects malformed or unsupported envelope data.
 pub fn serialize(header: &VaultHeader) -> Result<Vec<u8>, AppError> {
+    validate_production(header)?;
+    serialize_trusted_fixture(header)
+}
+
+/// Preserves closed-G1 empty-slot test fixtures, without production admission.
+/// # Errors
+/// Invalid or unsupported envelope.
+pub fn serialize_trusted_fixture(header: &VaultHeader) -> Result<Vec<u8>, AppError> {
     validate(header)?;
     serde_json::to_vec(header).map_err(|_| AppError::new(ErrorCode::CorruptHeader))
 }
@@ -57,9 +74,32 @@ fn validate(header: &VaultHeader) -> Result<(), AppError> {
         || header.hkdf != "HKDF-SHA-256"
         || header.hash != "SHA-256"
         || header.keyslot_format_version != 1
-        || !header.keyslots.is_empty()
     {
         return Err(AppError::new(ErrorCode::UnsupportedVaultVersion));
+    }
+    if !header.keyslots.is_empty() {
+        validate_production(header)?;
+    }
+    Ok(())
+}
+
+/// Production requires one passphrase and at most one independent recovery/device slot.
+/// # Errors
+/// Empty, duplicate, malformed or unsupported slots.
+pub fn validate_production(header: &VaultHeader) -> Result<(), AppError> {
+    if header.keyslots.is_empty() || header.keyslots.len() > 3 {
+        return Err(AppError::new(ErrorCode::CorruptHeader));
+    }
+    let mut types = std::collections::HashSet::new();
+    let mut ids = std::collections::HashSet::new();
+    for slot in &header.keyslots {
+        dvm_crypto::keyslots::validate_slot(slot)?;
+        if !types.insert(slot.slot_type.as_str()) || !ids.insert(slot.id.as_str()) {
+            return Err(AppError::new(ErrorCode::CorruptHeader));
+        }
+    }
+    if !types.contains("passphrase-v1") {
+        return Err(AppError::new(ErrorCode::CorruptHeader));
     }
     Ok(())
 }
@@ -70,8 +110,8 @@ mod tests {
     #[test]
     fn roundtrip_and_fail_closed_matrix() -> Result<(), Box<dyn std::error::Error>> {
         let header = injected_key_header();
-        let bytes = serialize(&header)?;
-        assert_eq!(parse(&bytes)?, header);
+        let bytes = serialize_trusted_fixture(&header)?;
+        assert_eq!(parse_trusted_fixture(&bytes)?, header);
         for field in [
             "format_version",
             "vault_id",
@@ -82,7 +122,7 @@ mod tests {
             let mut value = serde_json::to_value(&header)?;
             value.as_object_mut().ok_or("object")?.remove(field);
             assert_eq!(
-                parse(&serde_json::to_vec(&value)?)
+                parse_trusted_fixture(&serde_json::to_vec(&value)?)
                     .err()
                     .ok_or("must fail")?
                     .code,
@@ -97,7 +137,7 @@ mod tests {
             let mut value = serde_json::to_value(&header)?;
             value[field] = 99.into();
             assert_eq!(
-                parse(&serde_json::to_vec(&value)?)
+                parse_trusted_fixture(&serde_json::to_vec(&value)?)
                     .err()
                     .ok_or("must fail")?
                     .code,
@@ -106,15 +146,18 @@ mod tests {
         }
         let mut bad = header.clone();
         bad.aead = "unknown".into();
-        assert!(serialize(&bad).is_err());
+        assert!(serialize_trusted_fixture(&bad).is_err());
         bad = header.clone();
         bad.vault_id = "../../private".into();
         assert_eq!(
-            serialize(&bad).err().ok_or("must fail")?.code,
+            serialize_trusted_fixture(&bad)
+                .err()
+                .ok_or("must fail")?
+                .code,
             ErrorCode::CorruptHeader
         );
         for length in 0..bytes.len() {
-            assert!(parse(&bytes[..length]).is_err());
+            assert!(parse_trusted_fixture(&bytes[..length]).is_err());
         }
         Ok(())
     }
