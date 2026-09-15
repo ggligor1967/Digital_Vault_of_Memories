@@ -1635,7 +1635,13 @@ fn provider_secret_lookup_semantics() -> TestResult {
     let provider = ProviderSecretStore::new(Shared(Arc::clone(&inner)));
     let reference = "dvm/provider/synthetic/g2-lookup";
 
-    // Missing: the store answered, and there is nothing there.
+    // Missing: the store answered, and there is nothing there. Asserted as a
+    // classification too, not only through the boolean it produces, so that
+    // absence stays distinguishable from an entry that merely cannot be used.
+    assert!(
+        missing(&inner.retrieve(reference)?),
+        "an unwritten reference was not classified as absent"
+    );
     assert!(
         !provider.configured("synthetic", "g2-lookup")?,
         "an absent provider credential was reported as configured"

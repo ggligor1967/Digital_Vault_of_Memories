@@ -324,8 +324,8 @@ vault was copied in; the clone contained none of them.
 
 | Property                         | Result                                                                                                                                                                 |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Candidate under test             | `04a7c5ae7c172bae62da979e3e9d7b4b28cfa950`                                                                                                                             |
-| Tree                             | `9b09d05efa72e4e4b0f065cfb66dc30d68a66ad7`                                                                                                                             |
+| Candidate under test             | `9704ce26d3e293de73db39cfb45901aacf36db42`                                                                                                                             |
+| Tree                             | `dc6f6bd1fe30fe7abcfa3efae312dbaad576e526`                                                                                                                             |
 | `pnpm install --frozen-lockfile` | EXIT 0                                                                                                                                                                 |
 | `pnpm verify:g2 --cleanroom`     | EXIT 0, `CLEAN_ROOM_G2=PASS`                                                                                                                                           |
 | Mandatory skips                  | 0 (`steps: 16 run, 0 skipped, 0 failed, 0 not reached`)                                                                                                                |
@@ -359,8 +359,11 @@ distinction was established by evidence rather than assumed:
   tracked file — was removed, restoring 10.1 GB, and the gate then executed the
   multi-GB and crash gates to completion.
 
-Neither event altered the candidate. The green run above is a single
-uninterrupted `pnpm verify:g2 --cleanroom` over the unmodified candidate tree.
+Neither event altered any candidate. Both were observed while validating the
+first candidate, `04a7c5a`, which also reached `CLEAN_ROOM_G2=PASS` once the
+host limits were cleared. The clean room recorded above is a separate, fresh
+clone at the final commit; its run was uninterrupted and needed no retry — a
+single `pnpm verify:g2 --cleanroom` over the unmodified candidate tree.
 
 ## Scope
 
@@ -378,6 +381,43 @@ Unchanged: `Cargo.lock`, `pnpm-lock.yaml`, every `Cargo.toml` and
 `package.json`, every workflow. libsodium 1.0.22, libsodium-sys-stable 1.24.0
 and Argon2id v1.3 are untouched, as are the keyslot format, AAD construction,
 DVB1, SQLCipher configuration, Tauri permissions and CSP. No G3 work.
+
+## Follow-up commit: cross-platform dead code
+
+The first remediation commit, `b8479166f13829f71f390615a8f405038868e8d6`, was
+pushed and failed exact-head CI. The failure was real and deterministic, and it
+is recorded here rather than rewritten away.
+
+`missing()`, one of the three lookup-classification predicates added to the G2
+test module, had call sites only inside `#[cfg(windows)]` tests. On
+`ubuntu-latest` it was therefore dead code, and G0's
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+rejected it under `-D dead-code`. Windows G0 passed, as did G1; the local and
+clean-room gates run on Windows only, so neither could observe it.
+
+The fix asserts the `Missing` classification directly in
+`provider_secret_lookup_semantics`, which is cross-platform. This removes the
+dead code by using the predicate rather than by silencing the lint, and it
+closes a genuine gap in that oracle: absence had been asserted only indirectly,
+through `configured()` returning `false`, while the other two classes were
+asserted as classifications. All three are now asserted the same way.
+
+No production code changed. The correction is one assertion in one test.
+
+Because `b847916` was already published, it was not amended, reset or
+force-pushed. The fix is a second, append-only commit. That exceeds the
+single-commit envelope this transaction authorized, and the deviation is
+recorded deliberately: the alternative was leaving a red branch behind an
+unamendable commit.
+
+A local proxy for the non-Windows build was added to the verification for this
+commit: the Windows-gated test items were temporarily disabled
+(`#[cfg(windows)]` → `#[cfg(all(windows, any()))]`) and clippy re-run, so that
+cfg-dependent dead code in the test module is observable on a Windows host. All
+three predicates, and every other helper added by this remediation, are live
+under that configuration. The only diagnostics it produces concern
+`#[cfg(windows)]` items inside `credentials.rs` that do not exist at all on a
+non-Windows target, including pre-existing ones unrelated to this change.
 
 ## Known limitations
 
@@ -401,5 +441,9 @@ DVB1, SQLCipher configuration, Tauri permissions and CSP. No G3 work.
   stored content as blob bytes and as the plaintext each credential recovers
   rather than as a database digest. Comparing the digest would test SQLite, not
   the repair.
+- **Windows-only gates.** `pnpm verify:g2`, locally and in the clean room, runs
+  only on Windows; the cross-platform half of G0 exists only in CI. The
+  simulation described above narrows that gap for cfg-dependent dead code in
+  the G2 test module, but it is a proxy, not a Linux build.
 - This remediation does not advance G2. G2 acceptance depends on exact-head CI
   and fresh reviews recorded separately.
