@@ -851,6 +851,22 @@ dependencies = [
 [[package]]
 name = "dvm-backup"
 version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "dvm-crypto",
+ "dvm-domain",
+ "dvm-storage",
+ "getrandom 0.4.3",
+ "hkdf",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "uuid",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
 
 [[package]]
 name = "dvm-crypto"

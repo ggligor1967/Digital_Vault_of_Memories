@@ -1,0 +1,11 @@
+# G3 recovery operations
+
+These are trusted Rust backend operations. There is no renderer backup command or general filesystem picker. Keep a passphrase or recovery secret independently: a backup does not replace either secret. The device quick-unlock credential is held by the OS and is never in DVBK1.
+
+1. Unlock the source vault with passphrase or recovery material. Call `dvm_backup::create_backup(&open_vault, &new_dvmbak_path)` with an absent `.dvmbak` path outside the vault. A successful receipt means the archive was FULL verified and activated; `history_recorded` separately reports post-activation bookkeeping.
+2. Call `dvm_backup::verify_backup(&archive, &credential, VerificationMode::Structural)` for format, authenticated manifest, stored bytes, SQLCipher, and migration checks. Use `VerificationMode::Full` before calling it restorable: this authenticates and hashes every plaintext canonical blob.
+3. Call `dvm_backup::restore_backup(&archive, &absent_destination, &credential, credential_store)` on the destination volume. It stages beside the final path, performs FULL verification and normal unlock, then activates. Unlock the restored vault through the ordinary G2 path and inspect canonical data.
+
+Verification failure means the archive is not proven restorable. Preserve it for diagnosis and use another verified recovery point. Disk-full or write failure leaves no successful final backup; application-owned staging residue can be inspected and removed when no operation is running. An interrupted restore leaves the final path absent until activation. After activation the final vault is complete, even if the process stopped before returning success. Never remove an existing destination to work around `RESTORE_CONFLICT` without an independent operator decision.
+
+Future-schema refusal requires a newer compatible binary; the older binary must not migrate or mutate it. Migration failure leaves the pre- or complete post-migration version; diagnose checksum/history mismatches from a verified copy and do not edit committed migration bytes. A restored `device-v1` slot can reference a missing local OS credential; use passphrase or recovery, then re-enroll the device through G2 authenticated behavior. No physical secure-erasure or hardware power-loss guarantee is asserted.

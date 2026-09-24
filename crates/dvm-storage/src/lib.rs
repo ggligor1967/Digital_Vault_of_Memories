@@ -5,6 +5,7 @@ pub mod header;
 pub mod security;
 
 mod jobs;
+pub mod migrations;
 mod vault;
 pub use vault::Vault;
 #[cfg(test)]

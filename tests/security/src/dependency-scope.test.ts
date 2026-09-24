@@ -31,9 +31,8 @@ const LATER_GATE_DEPENDENCIES: { fragment: string; gate: string }[] = [
   { fragment: 'aes-gcm', gate: 'G2' },
   { fragment: 'ring', gate: 'G2' },
   { fragment: 'tauri-plugin-stronghold', gate: 'G2' },
-  // G3 — backup
+  // G3 — zip remains unselected; only exact-pinned tar in dvm-backup is admitted.
   { fragment: 'zip', gate: 'G3' },
-  { fragment: 'tar', gate: 'G3' },
   // G4 — search
   { fragment: 'hnsw', gate: 'G4' },
   { fragment: 'tantivy', gate: 'G4' },
@@ -152,7 +151,7 @@ describe('dependency scope', () => {
     for (const { manifest, name } of allDependencies) {
       for (const { fragment, gate } of LATER_GATE_DEPENDENCIES) {
         if (matchesFragment(name, fragment)) {
-          violations.push(`${manifest}: "${name}" is ${gate} scope, but G2 is the current gate`);
+          violations.push(`${manifest}: "${name}" is ${gate} scope, but G3 is the current gate`);
         }
       }
     }
@@ -189,7 +188,7 @@ describe('dependency scope', () => {
 });
 
 describe('reserved crates', () => {
-  const RESERVED = ['dvm-search', 'dvm-ai', 'dvm-media', 'dvm-backup'];
+  const RESERVED = ['dvm-search', 'dvm-ai', 'dvm-media'];
 
   it('declare no third-party dependency yet', () => {
     for (const crate of RESERVED) {
@@ -198,6 +197,17 @@ describe('reserved crates', () => {
 
       expect(declared, `${manifest} must stay dependency-free until its gate opens`).toEqual([]);
     }
+  });
+
+  it('admits only the selected exact-pinned G3 archive in the backup crate', () => {
+    const manifest = readRepoFile('crates/dvm-backup/Cargo.toml');
+    expect(manifest).toContain('tar = "=0.4.46"');
+    const archiveDependencies = cargoDependencyNames().filter(({ name }) =>
+      ['tar', 'zip'].includes(name),
+    );
+    expect(archiveDependencies).toEqual([
+      { manifest: 'crates/dvm-backup/Cargo.toml', name: 'tar' },
+    ]);
   });
 
   it('contain only a documented placeholder, not an implementation', () => {
@@ -226,7 +236,6 @@ describe('native storage boundary', () => {
       'openai',
       'ffmpeg',
       'zip',
-      'tar',
       'extism',
       'wasmtime',
       'wasmer',

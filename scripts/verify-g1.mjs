@@ -1,6 +1,7 @@
 /** G1 acceptance composes the foundation gate and explicitly required heavyweight proof. */
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, statfsSync } from 'node:fs';
+import { appendFileSync, realpathSync, rmSync, statfsSync } from 'node:fs';
+import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -41,6 +42,16 @@ function run(command, args) {
 }
 summary('DVM-V2 / G1 — ZERO-LOSS VAULT STORAGE');
 run('node', ['scripts/verify-g0.mjs', ...(ci ? ['--no-runtime'] : [])]);
+if (process.env.DVM_G3_TRIM_DEBUG_AFTER_G0 === '1' && !ci) {
+  const workspace = realpathSync(root);
+  const debug = join(workspace, 'target', 'debug');
+  const resolvedDebug = realpathSync(debug);
+  if (resolve(resolvedDebug) !== resolve(debug) || !resolvedDebug.startsWith(workspace + sep)) {
+    throw new Error('G3 debug-output cleanup path escaped the workspace.');
+  }
+  rmSync(resolvedDebug, { recursive: true });
+  summary(`G3_DISK_TRIM=PASS removed regenerated ${resolvedDebug} after complete G0 verification`);
+}
 // cfg(test) child-process matrix is part of the foundation workspace Rust tests.
 // Release testing separately verifies optimized crypto and the same real storage paths.
 run('cargo', [

@@ -2,11 +2,11 @@
 
 ## The one rule that shapes everything else
 
-Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. G0 and G1 are CLOSED. The current gate is **G2 — security and key lifecycle**.
+Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. G0, G1, and G2 are CLOSED. The current gate is **G3 — recovery, backup and migration**.
 
 This is not process for its own sake. Blueprint v2 replaced an architecture that made guarantees it could not keep, and it did so by ordering the work so that correctness, security and recoverability are proven _before_ the features that depend on them. A change that implements part of G1 while G0 is open does not accelerate anything; it removes the evidence that G0 was ever true.
 
-G2 additionally authorizes the exactly pinned Argon2id and native Windows credential adapters documented in ADR-0006 through ADR-0009. AI/model providers, HNSW/search, FFmpeg/media, backup/archive and plugin frameworks remain prohibited. Provider-secret storage grants no network authority.
+G2 authorized the exactly pinned Argon2id and native Windows credential adapters documented in ADR-0006 through ADR-0009. G3 adds only the pinned tar container and Windows no-replace activation adapter described in ADR-0013 and ADR-0014. AI/model providers, HNSW/search, FFmpeg/media and plugin frameworks remain prohibited. Provider-secret storage grants no network authority.
 
 Before direct Cargo commands, run `node scripts/prepare-sodium.mjs` on Windows x64.
 All repository gates run this prerequisite automatically. It verifies the pinned
@@ -130,3 +130,11 @@ API decision. A renderer presentation workaround is not authorized.
 Candidate publication requires local and exact-source clean-room PASS. After
 clean-room proof, only the evidence document may be amended before publication.
 G2 must not be merged or advance G3 in the implementation transaction.
+
+## G3 recovery evidence
+
+Run `pnpm verify:g3` before a candidate. A fresh short-path clone must pass
+`pnpm install --frozen-lockfile` and `pnpm verify:g3 --cleanroom`. Only the G3
+evidence document may change after that source proof. Keep backups outside the
+source vault, use FULL verification before calling one restorable, and never
+overwrite a restore destination. See [recovery operations](docs/recovery.md).

@@ -88,6 +88,198 @@ impl Drop for Fixture {
 fn key() -> VaultMasterKey {
     VaultMasterKey::from_injected_bytes(Zeroizing::new([11; 32]))
 }
+
+#[test]
+fn sqlcipher_online_backup_encrypts_destination_with_live_wal() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let sentinel = "G3_ENCRYPTED_SNAPSHOT_SENTINEL";
+    vault.db()?.execute_batch(
+        "PRAGMA wal_autocheckpoint=0; CREATE TABLE g3_snapshot_probe(value TEXT NOT NULL);",
+    )?;
+    vault
+        .db()?
+        .execute("INSERT INTO g3_snapshot_probe VALUES (?1)", [sentinel])?;
+    let snapshot = fixture.root.join("snapshot.db");
+    let (db_key, _) = key().storage_keys()?;
+    let source = vault.db()?;
+    crate::database::snapshot_encrypted(&source, &snapshot, &db_key)?;
+    drop(source);
+    let bytes = fs::read(&snapshot)?;
+    assert!(!bytes.starts_with(b"SQLite format 3"));
+    assert!(
+        !bytes
+            .windows(sentinel.len())
+            .any(|window| window == sentinel.as_bytes())
+    );
+    let reopened = rusqlite::Connection::open(&snapshot)?;
+    reopened.pragma_update(
+        None,
+        "key",
+        format!("x'{}'", dvm_crypto::dvb1::hex(db_key.as_bytes())),
+    )?;
+    assert_eq!(
+        reopened.query_row("SELECT value FROM g3_snapshot_probe", [], |row| row
+            .get::<_, String>(0))?,
+        sentinel
+    );
+    crate::database::integrity(&reopened)?;
+    let sqlite_version: String =
+        reopened.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
+    println!("G3_SQLITE_RUNTIME_VERSION={sqlite_version}");
+    println!("G3_SQLCIPHER_ONLINE_BACKUP_PROBE=PASS");
+    Ok(())
+}
+
+fn downgrade_test_database_to_v1(vault: &Vault) -> TestResult {
+    let mut database = vault.db()?;
+    let transaction = database.transaction()?;
+    transaction.execute_batch("DROP TABLE backup_history; DELETE FROM schema_migrations WHERE version=2; PRAGMA user_version=1;")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn g3_migration_checkpoint(name: &str) {
+    if std::env::var("DVM_G3_MIGRATION_CHECKPOINT").is_ok_and(|point| point == name) {
+        std::process::exit(91);
+    }
+}
+
+#[test]
+fn g3_migration_crash_child() -> TestResult {
+    let Ok(root) = std::env::var("DVM_G3_MIGRATION_ROOT") else {
+        return Ok(());
+    };
+    drop(Vault::open_with_injected_key(
+        std::path::Path::new(&root),
+        &key(),
+        NOW,
+    )?);
+    Err("migration checkpoint not reached".into())
+}
+
+#[test]
+fn g3_migration_atomicity_and_checksum_matrix() -> TestResult {
+    use crate::migrations::{Risk, require_recovery_point};
+    assert_eq!(
+        require_recovery_point(Risk::High, false)
+            .err()
+            .ok_or("high risk accepted")?
+            .code,
+        ErrorCode::MigrationFailed
+    );
+    require_recovery_point(Risk::High, true)?;
+    for (point, committed) in [
+        ("before_transaction", false),
+        ("after_begin", false),
+        ("after_sql", false),
+        ("after_bookkeeping", false),
+        ("before_user_version", false),
+        ("before_commit", false),
+        ("after_commit", true),
+    ] {
+        let fixture = Fixture::new()?;
+        let vault = fixture.create()?;
+        downgrade_test_database_to_v1(&vault)?;
+        drop(vault);
+        let status = Command::new(std::env::current_exe()?)
+            .args(["tests::g3_migration_crash_child", "--exact", "--nocapture"])
+            .env("DVM_G3_MIGRATION_ROOT", fixture.vault_path())
+            .env("DVM_G3_MIGRATION_CHECKPOINT", point)
+            .status()?;
+        assert_eq!(status.code(), Some(91), "checkpoint {point}");
+        let (db_key, _) = key().storage_keys()?;
+        let db = rusqlite::Connection::open(fixture.vault_path().join("metadata.db"))?;
+        db.pragma_update(
+            None,
+            "key",
+            format!("x'{}'", dvm_crypto::dvb1::hex(db_key.as_bytes())),
+        )?;
+        let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, if committed { 2 } else { 1 }, "checkpoint {point}");
+        crate::migrations::validate_history(&db, version)?;
+        let table_count: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='backup_history'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(table_count, i64::from(committed), "checkpoint {point}");
+        drop(db);
+        let reopened = fixture.reopen()?;
+        assert_eq!(
+            reopened
+                .db()?
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?,
+            2
+        );
+    }
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    vault.db()?.execute(
+        "UPDATE schema_migrations SET checksum='tampered' WHERE version=2",
+        [],
+    )?;
+    drop(vault);
+    assert_eq!(
+        fixture.reopen().err().ok_or("v2 checksum accepted")?.code,
+        ErrorCode::MigrationFailed
+    );
+    println!("G3_MIGRATION_CRASH_MATRIX=PASS G3_MIGRATION_CHECKSUM=PASS G3_HIGH_RISK_POLICY=PASS");
+    Ok(())
+}
+
+#[test]
+fn g3_future_schema_refusal_preserves_database_wal_and_blobs() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let source = fixture.source(b"future schema canonical blob")?;
+    let imported = vault.commit_import(vault.stage_import(&source)?)?;
+    vault.db()?.execute_batch("PRAGMA wal_autocheckpoint=0")?;
+    let (db_key, _) = key().storage_keys()?;
+    let reader = rusqlite::Connection::open(fixture.vault_path().join("metadata.db"))?;
+    reader.pragma_update(
+        None,
+        "key",
+        format!("x'{}'", dvm_crypto::dvb1::hex(db_key.as_bytes())),
+    )?;
+    reader.execute_batch("BEGIN")?;
+    let _: i64 = reader.query_row("SELECT count(*) FROM blobs", [], |row| row.get(0))?;
+    vault.db()?.pragma_update(None, "user_version", 99)?;
+    drop(vault);
+    let paths = [
+        fixture.vault_path().join("metadata.db"),
+        fixture.vault_path().join("metadata.db-wal"),
+        fixture.vault_path().join("metadata.db-shm"),
+        canonical_path_for_test(&fixture, &imported.blob_id),
+    ];
+    let before = paths.iter().map(fs::read).collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        fixture.reopen().err().ok_or("future schema accepted")?.code,
+        ErrorCode::MigrationRequired
+    );
+    let after = paths.iter().map(fs::read).collect::<Result<Vec<_>, _>>()?;
+    for index in [0, 1, 3] {
+        let path = &paths[index];
+        assert!(
+            before[index] == after[index],
+            "future-schema probe changed {}",
+            path.file_name()
+                .ok_or("missing filename")?
+                .to_string_lossy()
+        );
+    }
+    println!(
+        "G3_FUTURE_SCHEMA_SHM_TRANSIENT_CHANGED={}",
+        before[2] != after[2]
+    );
+    reader.execute_batch("ROLLBACK")?;
+    println!("G3_FUTURE_SCHEMA_NO_MUTATION=PASS");
+    Ok(())
+}
+
+fn canonical_path_for_test(fixture: &Fixture, id: &str) -> PathBuf {
+    fixture.vault_path().join("blobs").join(format!("{id}.dvb"))
+}
 fn count(vault: &Vault, table: &str) -> Result<i64, AppError> {
     vault
         .db()?
