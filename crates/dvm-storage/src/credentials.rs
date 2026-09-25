@@ -131,12 +131,58 @@ mod native {
     };
     use dvm_domain::security::CleanupOutcome;
     use keyring_core::{Entry, api::CredentialStoreApi};
+    #[cfg(test)]
+    use std::cell::Cell;
     use std::{collections::HashMap, sync::Mutex};
     use zeroize::Zeroizing;
 
     // Serialize across adapter instances: Windows does not promise reliable
     // ordering for concurrent reads/writes to the same credential.
     static ACCESS: Mutex<()> = Mutex::new(());
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum StoreFailureStage {
+        EntryBuild,
+        SetSecret,
+        ReadPersistenceAttributes,
+        PersistenceNotLocal,
+        OtherOperational,
+    }
+    #[cfg(test)]
+    thread_local! {
+        static STORE_FAILURE_STAGE: Cell<Option<StoreFailureStage>> = const { Cell::new(None) };
+        static COMPENSATION_FAILED: Cell<bool> = const { Cell::new(false) };
+    }
+    #[cfg(test)]
+    fn record_store_failure(stage: StoreFailureStage) {
+        STORE_FAILURE_STAGE.with(|recorded| recorded.set(Some(stage)));
+    }
+    #[cfg(test)]
+    pub(crate) fn take_store_failure_diagnostic() -> (StoreFailureStage, bool) {
+        let stage = STORE_FAILURE_STAGE
+            .with(Cell::take)
+            .unwrap_or(StoreFailureStage::OtherOperational);
+        let compensation_failed = COMPENSATION_FAILED.with(Cell::take);
+        (stage, compensation_failed)
+    }
+    // Keep the retrieval error boundary here so the old fallible conversion can be
+    // exercised by the negative control without involving Windows Credential Manager.
+    #[allow(clippy::unnecessary_wraps)]
+    fn classify_stored_secret(bytes: Zeroizing<Vec<u8>>) -> Result<CredentialLookup, AppError> {
+        Ok(CredentialLookup::classify(bytes))
+    }
+    #[test]
+    fn invalid_stored_bytes_are_classified_without_native_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MARKER: &str =
+            "a zero-byte stored credential was not classified as an unusable stored value";
+        let lookup = classify_stored_secret(Zeroizing::new(Vec::new())).map_err(|_| MARKER)?;
+        assert!(
+            matches!(lookup, CredentialLookup::InvalidStoredValue),
+            "{MARKER}"
+        );
+        Ok(())
+    }
     fn entry(reference: &str) -> Result<Entry, AppError> {
         validate_reference(reference)?;
         let store = windows_native_keyring_store::Store::new().map_err(|_| failure())?;
@@ -170,10 +216,18 @@ mod native {
     /// The write path's stricter reading: anything but local persistence is a
     /// failure to be compensated, not a value to be classified.
     fn local(entry: &Entry) -> Result<(), AppError> {
-        if persisted_locally(entry)? {
-            Ok(())
-        } else {
-            Err(failure())
+        match persisted_locally(entry) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                #[cfg(test)]
+                record_store_failure(StoreFailureStage::PersistenceNotLocal);
+                Err(failure())
+            }
+            Err(error) => {
+                #[cfg(test)]
+                record_store_failure(StoreFailureStage::ReadPersistenceAttributes);
+                Err(error)
+            }
         }
     }
     /// Post-write verification of the persistence class Windows actually
@@ -183,6 +237,8 @@ mod native {
     /// compensation branch cannot perturb `retrieve`.
     fn verify_persisted(reference: &str, entry: &Entry) -> Result<(), AppError> {
         if super::post_write_seam::verification_fails(reference) {
+            #[cfg(test)]
+            record_store_failure(StoreFailureStage::OtherOperational);
             return Err(failure());
         }
         local(entry)
@@ -194,12 +250,18 @@ mod native {
     /// beside it.
     fn compensate(reference: &str, entry: &Entry) -> CleanupOutcome {
         if super::post_write_seam::compensation_fails(reference) {
+            #[cfg(test)]
+            COMPENSATION_FAILED.with(|recorded| recorded.set(true));
             // Distinctly classified, so a masked primary failure is detectable.
             return CleanupOutcome::Failed(Box::new(AppError::new(super::ErrorCode::DiskFull)));
         }
         match entry.delete_credential() {
             Ok(()) | Err(keyring_core::Error::NoEntry) => CleanupOutcome::Completed,
-            Err(_) => CleanupOutcome::Failed(Box::new(failure())),
+            Err(_) => {
+                #[cfg(test)]
+                COMPENSATION_FAILED.with(|recorded| recorded.set(true));
+                CleanupOutcome::Failed(Box::new(failure()))
+            }
         }
     }
     /// Records the non-secret disposition of a compensating removal. A poisoned
@@ -209,6 +271,34 @@ mod native {
         if let Ok(mut recorded) = super::POST_WRITE_COMPENSATION.lock() {
             *recorded = Some(cleanup);
         }
+    }
+    fn finish_post_write_verification(
+        verify: impl FnOnce() -> Result<(), AppError>,
+        compensate_written_credential: impl FnOnce() -> CleanupOutcome,
+    ) -> Result<(), AppError> {
+        if let Err(primary) = verify() {
+            record(compensate_written_credential());
+            return Err(primary);
+        }
+        Ok(())
+    }
+    #[test]
+    fn post_write_failure_attempts_compensation_without_native_store() {
+        use std::cell::Cell;
+
+        const MARKER: &str =
+            "no compensating delete was attempted after post-write verification failed";
+        let compensation_attempted = Cell::new(false);
+        let primary = finish_post_write_verification(
+            || Err(failure()),
+            || {
+                compensation_attempted.set(true);
+                CleanupOutcome::Completed
+            },
+        )
+        .expect_err("post-write verification failure expected");
+        assert!(compensation_attempted.get(), "{MARKER}");
+        assert_eq!(primary.code, super::ErrorCode::ProviderUnavailable);
     }
     /// Persists a raw blob the way an external writer or an earlier release
     /// could have left one, including representations no `SecretValue` holds.
@@ -225,19 +315,32 @@ mod native {
     }
     impl CredentialStore for WindowsCredentialStore {
         fn store(&self, reference: &str, secret: &SecretValue) -> Result<(), AppError> {
+            #[cfg(test)]
+            {
+                STORE_FAILURE_STAGE.with(|recorded| recorded.set(None));
+                COMPENSATION_FAILED.with(|recorded| recorded.set(false));
+            }
             let _guard = ACCESS.lock().map_err(|_| failure())?;
-            let entry = entry(reference)?;
-            entry.set_secret(secret.as_bytes()).map_err(|_| failure())?;
+            let entry = entry(reference);
+            #[cfg(test)]
+            if entry.is_err() {
+                record_store_failure(StoreFailureStage::EntryBuild);
+            }
+            let entry = entry?;
+            entry.set_secret(secret.as_bytes()).map_err(|_| {
+                #[cfg(test)]
+                record_store_failure(StoreFailureStage::SetSecret);
+                failure()
+            })?;
             // `set_secret` has already persisted the credential, so a failed
             // post-write verification must not leave it stored, least of all
             // under a persistence class this adapter forbids. The exact entry
             // just written is removed best effort, the verification failure
             // stays primary, and the removal is recorded beside it.
-            if let Err(primary) = verify_persisted(reference, &entry) {
-                record(compensate(reference, &entry));
-                return Err(primary);
-            }
-            Ok(())
+            finish_post_write_verification(
+                || verify_persisted(reference, &entry),
+                || compensate(reference, &entry),
+            )
         }
         /// Classifies what Windows actually holds, before any of it is trusted.
         ///
@@ -260,7 +363,7 @@ mod native {
             if !persisted_locally(&entry)? {
                 return Ok(CredentialLookup::InvalidStoredValue);
             }
-            Ok(CredentialLookup::classify(bytes))
+            classify_stored_secret(bytes)
         }
         fn delete(&self, reference: &str) -> Result<(), AppError> {
             let _guard = ACCESS.lock().map_err(|_| failure())?;
@@ -275,6 +378,8 @@ mod native {
 /// Test-only staging of raw persisted state; see [`native::store_raw`].
 #[cfg(all(windows, test))]
 pub(crate) use native::store_raw;
+#[cfg(all(windows, test))]
+pub(crate) use native::take_store_failure_diagnostic;
 
 #[cfg(not(windows))]
 impl CredentialStore for WindowsCredentialStore {

@@ -45,10 +45,10 @@ Toolchain versions are pinned in `.node-version`, the `packageManager` field, an
 ## Before you push
 
 ```powershell
-pnpm verify:g2
+pnpm verify:g3
 ```
 
-That runs every gate check in order and prints each command with its exact exit code. It is the same script CI runs, so a green run locally means a green run in CI for everything except the platform matrix.
+That runs the current local G3 gate and prints each command with its exact exit code. CI runs `pnpm verify:g3 --ci`, which uses CI mode and the platform matrix.
 
 If you only touched the renderer, the fast loop is:
 
@@ -103,7 +103,7 @@ Two rules about evidence are worth stating plainly, because both are easy to vio
 - **Screenshots are not evidence** for storage, security or recovery correctness. They can supplement a command transcript; they cannot replace one.
 - **A successful compile is not runtime proof.** Where a gate requires runtime behaviour, it requires a captured, mechanical observation of that behaviour — for G0, that is `pnpm runtime:evidence`.
 
-Do not report `PASS` for a step you skipped. `pnpm verify:g2` reports skipped steps as skipped for exactly this reason.
+Do not report `PASS` for a step you skipped. `pnpm verify:g3` reports skipped steps as skipped for exactly this reason.
 
 ## Closed G1 acceptance history
 

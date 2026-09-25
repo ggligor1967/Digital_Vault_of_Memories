@@ -253,6 +253,25 @@ mod tests {
             .code,
             ErrorCode::RestoreConflict
         );
+        #[cfg(target_os = "linux")]
+        {
+            let dangling = fixture.root.join("dangling-restored");
+            let missing = fixture.root.join("missing-target");
+            std::os::unix::fs::symlink(&missing, &dangling)?;
+            assert_eq!(
+                restore_backup(
+                    &archive,
+                    &dangling,
+                    &UnlockCredential::Passphrase(pass()?),
+                    Arc::clone(&store)
+                )
+                .err()
+                .ok_or("dangling restore symlink replaced")?
+                .code,
+                ErrorCode::RestoreConflict
+            );
+            assert_eq!(fs::read_link(&dangling)?, missing);
+        }
         let reopened = ProtectedVault::select(&restored, store)?;
         let restored_active = reopened.unlock(&UnlockCredential::Passphrase(pass()?))?;
         assert_eq!(
@@ -1943,8 +1962,10 @@ pub fn restore_backup(
     credential: &UnlockCredential,
     credentials: Arc<dyn CredentialStore>,
 ) -> Result<VerificationReceipt, AppError> {
-    if destination.exists() {
-        return Err(AppError::new(ErrorCode::RestoreConflict));
+    match fs::symlink_metadata(destination) {
+        Ok(_) => return Err(AppError::new(ErrorCode::RestoreConflict)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(&error)),
     }
     let parent = fs::canonicalize(destination.parent().ok_or_else(invalid)?)
         .map_err(|error| io_error(&error))?;
@@ -2011,11 +2032,13 @@ pub fn restore_backup(
         .map_err(|error| io_error(&error))?;
     #[cfg(test)]
     checkpoint("restore_before_activation");
-    if destination.exists() {
-        return Err(AppError::new(ErrorCode::RestoreConflict));
-    }
-    activate_directory_noreplace(&extracted.stage.root, &destination)
-        .map_err(|error| io_error(&error))?;
+    activate_directory_noreplace(&extracted.stage.root, &destination).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            AppError::new(ErrorCode::RestoreConflict)
+        } else {
+            io_error(&error)
+        }
+    })?;
     extracted.stage.activated = true;
     #[cfg(test)]
     checkpoint("restore_after_activation");

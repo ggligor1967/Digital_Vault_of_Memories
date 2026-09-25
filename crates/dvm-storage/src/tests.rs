@@ -90,6 +90,21 @@ fn key() -> VaultMasterKey {
 }
 
 #[test]
+fn owner_lock_releases_when_owner_drops_even_if_handle_was_duplicated() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let inherited_handle = vault.duplicate_owner_lock_for_test()?;
+    assert_eq!(
+        fixture.reopen().err().ok_or("second owner admitted")?.code,
+        ErrorCode::VaultLocked
+    );
+    drop(vault);
+    drop(fixture.reopen()?);
+    drop(inherited_handle);
+    Ok(())
+}
+
+#[test]
 fn sqlcipher_online_backup_encrypts_destination_with_live_wal() -> TestResult {
     let fixture = Fixture::new()?;
     let vault = fixture.create()?;

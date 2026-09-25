@@ -247,27 +247,15 @@ const cases = [
   },
   {
     // The START defect: raw persisted bytes promoted straight into the trusted
-    // value, so an empty stored credential — which Windows both accepts and
-    // returns — fails the read instead of being classified, and is
-    // indistinguishable from the credential service being unreachable. The
-    // repair an authenticated user is entitled to then refuses to run.
+    // value. Exercise the native adapter's shared classifier directly so an
+    // unrelated Windows enrollment failure cannot satisfy this mutation oracle.
     name: 'invalid-stored-credential-fails-the-read',
     path: 'crates/dvm-storage/src/credentials.rs',
     mutate: (s) =>
-      replaceBlock(
+      replaceOnce(
         s,
-        [
-          '            if !persisted_locally(&entry)? {',
-          '                return Ok(CredentialLookup::InvalidStoredValue);',
-          '            }',
-          '            Ok(CredentialLookup::classify(bytes))',
-        ],
-        [
-          '            if !persisted_locally(&entry)? {',
-          '                return Err(failure());',
-          '            }',
-          '            Ok(CredentialLookup::Present(SecretValue::new(bytes)?))',
-        ],
+        '        Ok(CredentialLookup::classify(bytes))',
+        '        Ok(CredentialLookup::Present(SecretValue::new(bytes)?))',
       ),
     args: [
       'test',
@@ -275,7 +263,7 @@ const cases = [
       '-p',
       'dvm-storage',
       '--lib',
-      'zero_length_stored_device_credential_is_classified_and_re_enrolled',
+      'invalid_stored_bytes_are_classified_without_native_store',
     ],
     marker: 'a zero-byte stored credential was not classified as an unusable stored value',
   },
@@ -317,15 +305,15 @@ const cases = [
       replaceBlock(
         s,
         [
-          '            if let Err(primary) = verify_persisted(reference, &entry) {',
-          '                record(compensate(reference, &entry));',
-          '                return Err(primary);',
-          '            }',
+          '        if let Err(primary) = verify() {',
+          '            record(compensate_written_credential());',
+          '            return Err(primary);',
+          '        }',
         ],
         [
-          '            if let Err(primary) = verify_persisted(reference, &entry) {',
-          '                return Err(primary);',
-          '            }',
+          '        if let Err(primary) = verify() {',
+          '            return Err(primary);',
+          '        }',
         ],
       ),
     args: [
@@ -334,7 +322,7 @@ const cases = [
       '-p',
       'dvm-storage',
       '--lib',
-      'post_write_persistence_failure_removes_the_credential_it_wrote',
+      'post_write_failure_attempts_compensation_without_native_store',
     ],
     marker: 'no compensating delete was attempted after post-write verification failed',
   },

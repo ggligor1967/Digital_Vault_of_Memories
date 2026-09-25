@@ -59,7 +59,9 @@ pub struct OpenVault {
     vault: Vault,
     vmk: VaultMasterKey,
     credentials: Arc<dyn CredentialStore>,
-    _keyslot_ownership: File,
+    // Retained for its Drop behavior after the vault owner closes.
+    #[allow(dead_code)]
+    keyslot_lock: crate::vault::FileLockOwner,
 }
 
 /// Trusted backend only. Key types have no renderer serialization or debug output.
@@ -363,7 +365,7 @@ impl SessionBackend for ProtectedVault {
             vault,
             vmk,
             credentials: Arc::clone(&self.credentials),
-            _keyslot_ownership: ownership,
+            keyslot_lock: crate::vault::FileLockOwner::new(ownership),
         })
     }
     fn health(active: &OpenVault) -> ReconciliationHealth {

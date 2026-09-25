@@ -21,7 +21,24 @@ function replaceIn(source, start, end, before, after) {
 }
 const storage = 'crates/dvm-storage/src/';
 const backup = 'crates/dvm-backup/src/dvbk1.rs';
+const activation = 'crates/dvm-backup/src/activation.rs';
 const cases = [
+  ...(process.platform === 'linux'
+    ? [
+        {
+          name: 'restore-directory-noreplace-regression',
+          path: activation,
+          mutate: (source) =>
+            replaceOnce(
+              source,
+              '    before_publish();\n    renameat_with(CWD, staging, CWD, destination, RenameFlags::NOREPLACE).map_err(Into::into)',
+              '    if destination.exists() { return Err(std::io::ErrorKind::AlreadyExists.into()); }\n    before_publish();\n    std::fs::rename(staging, destination)',
+            ),
+          package: 'dvm-backup',
+          test: 'competitor_at_publish_boundary_wins_without_replacement',
+        },
+      ]
+    : []),
   {
     name: 'migration-checksum-ignored',
     path: `${storage}migrations.rs`,

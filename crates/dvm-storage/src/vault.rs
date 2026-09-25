@@ -23,13 +23,36 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Releases the advisory lock before an inherited or duplicated handle can
+/// extend an owner's lifetime after this owner is dropped.
+pub(crate) struct FileLockOwner(File);
+
+impl FileLockOwner {
+    pub(crate) fn new(file: File) -> Self {
+        Self(file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate_handle_for_test(&self) -> std::io::Result<File> {
+        self.0.try_clone()
+    }
+}
+
+impl Drop for FileLockOwner {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Exclusive trusted vault owner. Share it through `Arc` for concurrent imports.
 /// The OS lock blocks competing processes and concurrent startup reconciliation.
 pub struct Vault {
     pub(crate) root: PathBuf,
     pub(crate) database: Mutex<Connection>,
     pub(crate) blob_root: BlobRootKey,
-    _ownership: File,
+    // Retained for its Drop behavior after the database connection closes.
+    #[allow(dead_code)]
+    owner_lock: FileLockOwner,
     /// Safe native cipher initialization evidence.
     pub cipher: CipherEvidence,
     /// Reconciliation performed before this instance admits writes.
@@ -47,6 +70,7 @@ pub(crate) fn io_error(error: &std::io::Error) -> AppError {
         ErrorCode::Internal
     })
 }
+
 /// Classifies a failure to reach a canonical blob.
 ///
 /// Only a genuinely absent file is `MissingBlob`: that code asserts canonical
@@ -170,6 +194,11 @@ impl PlaintextSink for VerifyOnly {
 }
 
 impl Vault {
+    #[cfg(test)]
+    pub(crate) fn duplicate_owner_lock_for_test(&self) -> std::io::Result<File> {
+        self.owner_lock.duplicate_handle_for_test()
+    }
+
     /// Creates only a trusted injected-key integration vault with no usable keyslot.
     /// No production UI/IPC calls this API. G2 must supply durable wrapped keys.
     /// # Errors
@@ -213,7 +242,7 @@ impl Vault {
             root,
             database: Mutex::new(db),
             blob_root,
-            _ownership: ownership,
+            owner_lock: FileLockOwner::new(ownership),
             cipher,
             reconciliation: healthy_report(),
             repair_required: AtomicBool::new(false),
@@ -267,7 +296,7 @@ impl Vault {
             root,
             database: Mutex::new(db),
             blob_root,
-            _ownership: ownership,
+            owner_lock: FileLockOwner::new(ownership),
             cipher,
             reconciliation: healthy_report(),
             repair_required: AtomicBool::new(false),
