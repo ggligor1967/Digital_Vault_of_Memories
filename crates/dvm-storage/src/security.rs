@@ -310,9 +310,7 @@ impl SessionBackend for ProtectedVault {
             .write(true)
             .open(self.root.join("local-state/keyslots.lock"))
             .map_err(|e| io_error(&e))?;
-        ownership
-            .try_lock()
-            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        let keyslot_lock = crate::vault::FileLockOwner::try_acquire(ownership)?;
         let envelope = read_header(&self.root)?;
         // One selection boundary for every credential kind: the slot type it
         // requires, and the classification for that slot being absent. A vault
@@ -365,7 +363,7 @@ impl SessionBackend for ProtectedVault {
             vault,
             vmk,
             credentials: Arc::clone(&self.credentials),
-            keyslot_lock: crate::vault::FileLockOwner::new(ownership),
+            keyslot_lock,
         })
     }
     fn health(active: &OpenVault) -> ReconciliationHealth {

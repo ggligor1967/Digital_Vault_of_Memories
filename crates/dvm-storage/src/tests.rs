@@ -105,6 +105,27 @@ fn owner_lock_releases_when_owner_drops_even_if_handle_was_duplicated() -> TestR
 }
 
 #[test]
+fn failed_vault_open_releases_owner_lock_while_duplicate_handle_survives() -> TestResult {
+    let fixture = Fixture::new()?;
+    drop(fixture.create()?);
+    crate::vault::FileLockOwner::arm_duplicate_for_test();
+    crate::vault::OPEN_AFTER_OWNER_LOCK_FAULT.with(|fault| fault.set(true));
+    assert_eq!(
+        fixture
+            .reopen()
+            .err()
+            .ok_or("injected open fault missed")?
+            .code,
+        ErrorCode::Internal
+    );
+    let inherited_handle = crate::vault::FileLockOwner::take_duplicate_for_test()
+        .ok_or("owner lock was not duplicated after acquisition")?;
+    drop(fixture.reopen()?);
+    drop(inherited_handle);
+    Ok(())
+}
+
+#[test]
 fn sqlcipher_online_backup_encrypts_destination_with_live_wal() -> TestResult {
     let fixture = Fixture::new()?;
     let vault = fixture.create()?;

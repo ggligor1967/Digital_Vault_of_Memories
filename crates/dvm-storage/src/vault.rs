@@ -28,14 +28,43 @@ use uuid::Uuid;
 pub(crate) struct FileLockOwner(File);
 
 impl FileLockOwner {
-    pub(crate) fn new(file: File) -> Self {
-        Self(file)
+    pub(crate) fn try_acquire(file: File) -> Result<Self, AppError> {
+        file.try_lock()
+            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        #[cfg(test)]
+        Self::capture_duplicate_for_test(&file);
+        Ok(Self(file))
     }
 
     #[cfg(test)]
     pub(crate) fn duplicate_handle_for_test(&self) -> std::io::Result<File> {
         self.0.try_clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn arm_duplicate_for_test() {
+        DUPLICATE_NEXT_LOCK.with(|armed| armed.set(true));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_duplicate_for_test() -> Option<File> {
+        DUPLICATED_LOCK.with(|duplicate| duplicate.borrow_mut().take())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_duplicate_for_test(file: &File) {
+        if DUPLICATE_NEXT_LOCK.with(std::cell::Cell::take) {
+            DUPLICATED_LOCK.with(|duplicate| *duplicate.borrow_mut() = file.try_clone().ok());
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DUPLICATE_NEXT_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DUPLICATED_LOCK: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static OPEN_AFTER_OWNER_LOCK_FAULT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 impl Drop for FileLockOwner {
@@ -234,9 +263,7 @@ impl Vault {
             .create_new(true)
             .open(root.join("local-state/owner.lock"))
             .map_err(|error| io_error(&error))?;
-        ownership
-            .try_lock()
-            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        let owner_lock = FileLockOwner::try_acquire(ownership)?;
         let mut header = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -256,7 +283,7 @@ impl Vault {
             root,
             database: Mutex::new(db),
             blob_root,
-            owner_lock: FileLockOwner::new(ownership),
+            owner_lock,
             cipher,
             reconciliation: healthy_report(),
             repair_required: AtomicBool::new(false),
@@ -301,16 +328,18 @@ impl Vault {
             .write(true)
             .open(root.join("local-state/owner.lock"))
             .map_err(|error| io_error(&error))?;
-        ownership
-            .try_lock()
-            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        let owner_lock = FileLockOwner::try_acquire(ownership)?;
+        #[cfg(test)]
+        if OPEN_AFTER_OWNER_LOCK_FAULT.with(std::cell::Cell::take) {
+            return Err(AppError::new(ErrorCode::Internal));
+        }
         let (db_key, blob_root) = key.storage_keys()?;
         let (db, cipher) = database::open(&root.join("metadata.db"), &db_key, false)?;
         let mut vault = Self {
             root,
             database: Mutex::new(db),
             blob_root,
-            owner_lock: FileLockOwner::new(ownership),
+            owner_lock,
             cipher,
             reconciliation: healthy_report(),
             repair_required: AtomicBool::new(false),

@@ -589,6 +589,88 @@ fn keyslot_lock_releases_when_owner_drops_even_if_handle_was_duplicated() -> Tes
 }
 
 #[test]
+fn failed_unlock_releases_keyslot_lock_before_next_credential() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = Arc::new(MemoryStore::default());
+    let created = ProtectedVault::create_with_policy(
+        &fixture.root(),
+        &pass("original phrase")?,
+        RecoveryPolicy::DeclinedAfterDataLossWarning,
+        ArgonProfile::BASELINE,
+        store.clone(),
+    )
+    .map_err(NotActivated::into_primary)?
+    .into_value();
+    let before = snapshot(&fixture.root())?;
+    for _ in 0..100 {
+        assert_eq!(
+            created
+                .backend
+                .unlock(&UnlockCredential::Recovery(RecoverySecret::generate()?))
+                .err()
+                .ok_or("missing recovery slot admitted")?
+                .code,
+            ErrorCode::BadPassphrase
+        );
+        assert_eq!(
+            created
+                .backend
+                .unlock(&UnlockCredential::Device)
+                .err()
+                .ok_or("missing device slot admitted")?
+                .code,
+            ErrorCode::ProviderUnavailable
+        );
+    }
+    assert_eq!(before, snapshot(&fixture.root())?);
+    assert!(
+        store
+            .0
+            .lock()
+            .map_err(|_| "credential store lock poisoned")?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_unlock_releases_lock_while_duplicate_handle_survives() -> TestResult {
+    let fixture = Fixture::new()?;
+    let created = ProtectedVault::create_with_policy(
+        &fixture.root(),
+        &pass("original phrase")?,
+        RecoveryPolicy::DeclinedAfterDataLossWarning,
+        ArgonProfile::BASELINE,
+        Arc::new(MemoryStore::default()),
+    )
+    .map_err(NotActivated::into_primary)?
+    .into_value();
+    crate::vault::FileLockOwner::arm_duplicate_for_test();
+    assert_eq!(
+        created
+            .backend
+            .unlock(&UnlockCredential::Recovery(RecoverySecret::generate()?))
+            .err()
+            .ok_or("missing recovery slot admitted")?
+            .code,
+        ErrorCode::BadPassphrase
+    );
+    let inherited_handle = crate::vault::FileLockOwner::take_duplicate_for_test()
+        .ok_or("keyslot lock was not duplicated after acquisition")?;
+    assert_eq!(
+        created
+            .backend
+            .unlock(&UnlockCredential::Device)
+            .err()
+            .ok_or("missing device slot admitted")?
+            .code,
+        ErrorCode::ProviderUnavailable
+    );
+    drop(inherited_handle);
+    Ok(())
+}
+
+#[test]
 fn creation_delivers_recovery_material_once_the_header_activates() -> TestResult {
     for (point, activated) in ACTIVATION_MATRIX {
         let f = Fixture::new()?;
