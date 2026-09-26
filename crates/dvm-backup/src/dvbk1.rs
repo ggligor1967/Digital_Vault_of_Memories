@@ -12,6 +12,7 @@ use dvm_domain::{
 use dvm_storage::{
     database, header, migrations,
     security::{OpenVault, ProtectedVault, UnlockCredential, unlock_backup_header},
+    validate_blob_storage_relpath,
 };
 use hkdf::Hkdf;
 use rusqlite::Connection;
@@ -37,6 +38,9 @@ const COPY_CHUNK: usize = 64 * 1024;
 thread_local! {
     static SNAPSHOT_RENDEZVOUS: std::cell::RefCell<Option<Arc<std::sync::Barrier>>> =
         const { std::cell::RefCell::new(None) };
+    static BEFORE_BACKUP_ACTIVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BACKUP_SNAPSHOT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Serialize, Deserialize)]
@@ -182,6 +186,219 @@ mod tests {
             digest.update(&chunk[..count]);
         }
         Ok(hex(&digest.finalize()))
+    }
+
+    #[test]
+    fn portable_storage_relpath_snapshot_accepts_only_exact_id_bound_forms()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch("CREATE TABLE blobs(id TEXT, sha256_hex TEXT, size_bytes INTEGER, storage_relpath TEXT); CREATE TABLE item_blobs(blob_id TEXT);")?;
+        let id = Uuid::new_v4().to_string();
+        db.execute(
+            "INSERT INTO blobs VALUES (?1,?2,8,'')",
+            [&id, &"0".repeat(64)],
+        )?;
+        db.execute("INSERT INTO item_blobs VALUES (?1)", [&id])?;
+        for relative in [format!("blobs/{id}.dvb"), format!("blobs\\{id}.dvb")] {
+            db.execute("UPDATE blobs SET storage_relpath=?1", [&relative])?;
+            assert_eq!(snapshot_blobs(&db)?.len(), 1);
+        }
+        for relative in [
+            format!("./blobs/{id}.dvb"),
+            format!("blobs//{id}.dvb"),
+            format!("blobs/./{id}.dvb"),
+            format!("blobs/../blobs/{id}.dvb"),
+            format!("blobs\\..\\blobs\\{id}.dvb"),
+            format!("/blobs/{id}.dvb"),
+            format!("C:\\blobs\\{id}.dvb"),
+            format!("\\\\server\\blobs\\{id}.dvb"),
+            format!("blobs/{id}.dvb/"),
+            format!("blobs/{id}.dvb:stream"),
+            format!("blobs/{id}.dvb\0"),
+            format!("blobs/{}.dvb", Uuid::new_v4()),
+        ] {
+            db.execute("UPDATE blobs SET storage_relpath=?1", [&relative])?;
+            assert_eq!(
+                snapshot_blobs(&db).unwrap_err().code,
+                ErrorCode::BackupInvalid,
+                "{relative:?}"
+            );
+        }
+        Ok(())
+    }
+
+    fn create_test_vault(fixture: &Fixture) -> Result<OpenVault, AppError> {
+        let created = ProtectedVault::create_with_policy(
+            &fixture.root.join("vault"),
+            &pass()?,
+            RecoveryPolicy::Generate,
+            ArgonProfile::BASELINE,
+            Arc::new(NoDeviceStore),
+        )
+        .map_err(NotActivated::into_primary)?
+        .into_value();
+        created
+            .backend
+            .unlock(&UnlockCredential::Passphrase(pass()?))
+    }
+
+    #[test]
+    fn portable_storage_relpath_backup_restore_preserves_legacy_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let active = create_test_vault(&fixture)?;
+        let source = fixture.root.join("source");
+        fs::write(&source, b"portable archive plaintext")?;
+        let imported = active.import(&source)?;
+        let header_bytes = fs::read(fixture.root.join("vault/vault.header"))?;
+        let vmk = unlock_backup_header(&header_bytes, &UnlockCredential::Passphrase(pass()?))?;
+        let (db_key, _) = vmk.storage_keys()?;
+        drop(active);
+        let db = Connection::open(fixture.root.join("vault/metadata.db"))?;
+        let key_literal = Zeroizing::new(format!("x'{}'", hex(db_key.as_bytes())));
+        db.pragma_update(None, "key", key_literal.as_str())?;
+        let legacy = format!("blobs\\{}.dvb", imported.blob_id);
+        db.execute("UPDATE blobs SET storage_relpath=?1", [&legacy])?;
+        db.close().map_err(|(_, error)| error)?;
+        let backend = ProtectedVault::select(&fixture.root.join("vault"), Arc::new(NoDeviceStore))?;
+        let active = backend.unlock(&UnlockCredential::Passphrase(pass()?))?;
+        let archive = fixture.root.join("legacy.dvmbak");
+        assert!(create_backup(&active, &archive)?.restorable);
+        drop(active);
+        let before = canonical_state(&fixture.root.join("vault/metadata.db"), &db_key)?;
+        for mode in [VerificationMode::Structural, VerificationMode::Full] {
+            assert_eq!(
+                verify_backup(&archive, &UnlockCredential::Passphrase(pass()?), mode)?
+                    .canonical_blob_count,
+                1
+            );
+        }
+        let restored = fixture.root.join("restored");
+        restore_backup(
+            &archive,
+            &restored,
+            &UnlockCredential::Passphrase(pass()?),
+            Arc::new(NoDeviceStore),
+        )?;
+        let backend = ProtectedVault::select(&restored, Arc::new(NoDeviceStore))?;
+        let active = backend.unlock(&UnlockCredential::Passphrase(pass()?))?;
+        assert_eq!(
+            active
+                .recover(&imported.blob_id, &mut DiscardPlaintext)?
+                .sha256_hex,
+            imported.sha256_hex
+        );
+        assert_eq!(
+            canonical_state(&restored.join("metadata.db"), &db_key)?,
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn backup_activation_error_classification_preserves_operational_failures() {
+        use std::io::ErrorKind;
+        for (kind, expected) in [
+            (ErrorKind::AlreadyExists, ErrorCode::RestoreConflict),
+            (ErrorKind::PermissionDenied, ErrorCode::Internal),
+            (ErrorKind::NotFound, ErrorCode::Internal),
+            (ErrorKind::Unsupported, ErrorCode::Internal),
+            (ErrorKind::StorageFull, ErrorCode::DiskFull),
+        ] {
+            assert_eq!(activation_error(&kind.into()).code, expected);
+        }
+    }
+
+    #[test]
+    fn backup_activation_conflict_preserves_competitor_and_records_no_history()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let active = create_test_vault(&fixture)?;
+        for kind in [
+            "file",
+            "empty-directory",
+            "occupied-directory",
+            #[cfg(unix)]
+            "dangling-symlink",
+        ] {
+            let destination = fixture.root.join(format!("race-{kind}.dvmbak"));
+            let competitor = destination.clone();
+            BEFORE_BACKUP_ACTIVATION.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || match kind {
+                    "file" => fs::write(&competitor, b"competitor").unwrap(),
+                    #[cfg(unix)]
+                    "dangling-symlink" => {
+                        std::os::unix::fs::symlink("missing-target", &competitor).unwrap();
+                    }
+                    _ => {
+                        fs::create_dir(&competitor).unwrap();
+                        if kind == "occupied-directory" {
+                            fs::write(competitor.join("sentinel"), b"competitor").unwrap();
+                        }
+                    }
+                }));
+            });
+            assert_eq!(
+                create_backup(&active, &destination).unwrap_err().code,
+                ErrorCode::RestoreConflict
+            );
+            match kind {
+                "file" => assert_eq!(fs::read(&destination)?, b"competitor"),
+                "occupied-directory" => {
+                    assert_eq!(fs::read(destination.join("sentinel"))?, b"competitor");
+                }
+                #[cfg(unix)]
+                "dangling-symlink" => {
+                    assert_eq!(fs::read_link(&destination)?, Path::new("missing-target"));
+                }
+                _ => assert_eq!(fs::read_dir(&destination)?.count(), 0),
+            }
+            let residue: Vec<_> = fs::read_dir(&fixture.root)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<_, _>>()?;
+            // Snapshot WAL/SHM sidecar lifecycle is outside activation classification.
+            assert!(
+                residue.iter().all(|name| {
+                    let name = name.to_string_lossy();
+                    !name.starts_with(".dvm-backup-")
+                        || (!name.ends_with(".part") && !name.ends_with(".snapshot"))
+                }),
+                "staging residue: {residue:?}"
+            );
+        }
+        let snapshot = fixture.root.join("history.snapshot");
+        let access = active.snapshot_for_backup(&snapshot)?;
+        let db = database::open_snapshot_readonly(&snapshot, &access.db_key)?;
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM backup_history", [], |row| row
+                .get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_activation_conflict_detects_dangling_symlink_before_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let active = create_test_vault(&fixture)?;
+        let destination = fixture.root.join("dangling.dvmbak");
+        let missing = fixture.root.join("missing");
+        std::os::unix::fs::symlink(&missing, &destination)?;
+        let snapshots_before = BACKUP_SNAPSHOT_COUNT.get();
+        let result = create_backup(&active, &destination);
+        assert_eq!(result.unwrap_err().code, ErrorCode::RestoreConflict);
+        assert_eq!(BACKUP_SNAPSHOT_COUNT.get(), snapshots_before);
+        assert_eq!(fs::read_link(&destination)?, missing);
+        assert!(fs::read_dir(&fixture.root)?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".dvm-backup-")
+        }));
+        Ok(())
     }
 
     #[test]
@@ -1253,6 +1470,13 @@ fn io_error(error: &std::io::Error) -> AppError {
         ErrorCode::Internal
     })
 }
+fn activation_error(error: &std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        AppError::new(ErrorCode::RestoreConflict)
+    } else {
+        io_error(error)
+    }
+}
 fn hex(bytes: &[u8]) -> String {
     dvm_crypto::dvb1::hex(bytes)
 }
@@ -1476,9 +1700,8 @@ fn snapshot_blobs(db: &Connection) -> Result<Vec<(String, DigestReceipt)>, AppEr
     for row in rows {
         let (id, sha256_hex, size, relative) = row.map_err(|_| invalid())?;
         let name = format!("blobs/{id}.dvb");
-        let expected_relative = Path::new("blobs").join(format!("{id}.dvb"));
         if !valid_member_name(&name)
-            || Path::new(&relative) != expected_relative.as_path()
+            || validate_blob_storage_relpath(&id, &relative).is_err()
             || size < 0
         {
             return Err(invalid());
@@ -1505,9 +1728,13 @@ pub fn create_backup(vault: &OpenVault, destination: &Path) -> Result<BackupRece
     if destination
         .extension()
         .is_none_or(|extension| extension != "dvmbak")
-        || destination.exists()
     {
         return Err(AppError::new(ErrorCode::RestoreConflict));
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => return Err(AppError::new(ErrorCode::RestoreConflict)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(&error)),
     }
     let parent = fs::canonicalize(destination.parent().ok_or_else(invalid)?)
         .map_err(|error| io_error(&error))?;
@@ -1521,6 +1748,8 @@ pub fn create_backup(vault: &OpenVault, destination: &Path) -> Result<BackupRece
     #[cfg(test)]
     checkpoint("before_staging");
     let result = (|| {
+        #[cfg(test)]
+        BACKUP_SNAPSHOT_COUNT.set(BACKUP_SNAPSHOT_COUNT.get() + 1);
         let access = vault.snapshot_for_backup(&snapshot)?;
         #[cfg(test)]
         SNAPSHOT_RENDEZVOUS.with(|slot| {
@@ -1622,7 +1851,14 @@ pub fn create_backup(vault: &OpenVault, destination: &Path) -> Result<BackupRece
         }
         #[cfg(test)]
         checkpoint("before_activation");
-        activate_file_noreplace(&staging, &destination).map_err(|error| io_error(&error))?;
+        #[cfg(test)]
+        BEFORE_BACKUP_ACTIVATION.with(|slot| {
+            if let Some(before_activation) = slot.borrow_mut().take() {
+                before_activation();
+            }
+        });
+        activate_file_noreplace(&staging, &destination)
+            .map_err(|error| activation_error(&error))?;
         #[cfg(test)]
         checkpoint("after_activation");
         let history_recorded = vault.record_backup_activation(&backup_id).is_ok();
@@ -2032,13 +2268,8 @@ pub fn restore_backup(
         .map_err(|error| io_error(&error))?;
     #[cfg(test)]
     checkpoint("restore_before_activation");
-    activate_directory_noreplace(&extracted.stage.root, &destination).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            AppError::new(ErrorCode::RestoreConflict)
-        } else {
-            io_error(&error)
-        }
-    })?;
+    activate_directory_noreplace(&extracted.stage.root, &destination)
+        .map_err(|error| activation_error(&error))?;
     extracted.stage.activated = true;
     #[cfg(test)]
     checkpoint("restore_after_activation");

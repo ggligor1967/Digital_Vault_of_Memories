@@ -416,6 +416,93 @@ fn schema_identity_foreign_keys_and_future_version_refusal() -> TestResult {
 }
 
 #[test]
+fn portable_storage_relpath_is_written_on_every_platform() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let imported = dvm_application::storage::import(&vault, &fixture.source(b"portable")?)?;
+    let relative: String = vault.db()?.query_row(
+        "SELECT storage_relpath FROM blobs WHERE id=?1",
+        [&imported.blob_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(relative, format!("blobs/{}.dvb", imported.blob_id));
+    Ok(())
+}
+
+#[test]
+fn portable_storage_relpath_recovers_legacy_windows_and_portable_rows() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let source = b"portable recovery plaintext";
+    let imported = dvm_application::storage::import(&vault, &fixture.source(source)?)?;
+    drop(vault);
+    for separator in ["\\", "/"] {
+        let vault = fixture.reopen()?;
+        let relative = format!("blobs{separator}{}.dvb", imported.blob_id);
+        vault.db()?.execute(
+            "UPDATE blobs SET storage_relpath=?1 WHERE id=?2",
+            [&relative, &imported.blob_id],
+        )?;
+        let mut sink = BytesSink::default();
+        assert_eq!(
+            vault.recover(&imported.blob_id, &mut sink)?.sha256_hex,
+            imported.sha256_hex
+        );
+        assert_eq!(sink.committed, source);
+        drop(vault);
+        let reopened = fixture.reopen()?;
+        let mut sink = BytesSink::default();
+        reopened.recover(&imported.blob_id, &mut sink)?;
+        assert_eq!(sink.committed, source);
+        let stored: String = reopened.db()?.query_row(
+            "SELECT storage_relpath FROM blobs WHERE id=?1",
+            [&imported.blob_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            stored, relative,
+            "reading legacy metadata must not rewrite it"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn portable_storage_relpath_rejects_aliases_and_traversal_before_plaintext() -> TestResult {
+    let fixture = Fixture::new()?;
+    let vault = fixture.create()?;
+    let imported = dvm_application::storage::import(&vault, &fixture.source(b"private")?)?;
+    let id = &imported.blob_id;
+    for relative in [
+        format!("./blobs/{id}.dvb"),
+        format!("blobs//{id}.dvb"),
+        format!("blobs/./{id}.dvb"),
+        format!("blobs/../blobs/{id}.dvb"),
+        format!("blobs\\..\\blobs\\{id}.dvb"),
+        format!("/blobs/{id}.dvb"),
+        format!("C:\\blobs\\{id}.dvb"),
+        format!("\\\\server\\blobs\\{id}.dvb"),
+        format!("blobs/{id}.dvb/"),
+        format!("blobs/{id}.dvb:stream"),
+        format!("blobs/{id}.dvb\0"),
+        format!("blobs/{}.dvb", Uuid::new_v4()),
+    ] {
+        vault.db()?.execute(
+            "UPDATE blobs SET storage_relpath=?1 WHERE id=?2",
+            [&relative, id],
+        )?;
+        let mut sink = BytesSink::default();
+        assert_eq!(
+            vault.recover(id, &mut sink).unwrap_err().code,
+            ErrorCode::UnsupportedVaultVersion,
+            "{relative:?}"
+        );
+        assert!(sink.aborted && sink.committed.is_empty() && sink.staged.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn restart_recovers_exact_original_and_encrypted_private_metadata() -> TestResult {
     let fixture = Fixture::new()?;
     let vault = fixture.create()?;

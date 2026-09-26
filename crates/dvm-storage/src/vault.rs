@@ -176,9 +176,23 @@ pub(crate) fn uuid_bytes(id: &str) -> Result<[u8; 16], AppError> {
     }
     Ok(*parsed.as_bytes())
 }
-pub(crate) fn blob_relative(id: &str) -> Result<PathBuf, AppError> {
+/// Portable database spelling of a canonical blob's relative path.
+/// # Errors
+/// Rejects IDs that are not canonical lowercase hyphenated UUIDs.
+pub fn blob_storage_relpath(id: &str) -> Result<String, AppError> {
     uuid_bytes(id)?;
-    Ok(PathBuf::from("blobs").join(format!("{id}.dvb")))
+    Ok(format!("blobs/{id}.dvb"))
+}
+
+/// Validates portable or historical Windows metadata independently of the host OS.
+/// # Errors
+/// Rejects invalid IDs and every spelling except the two exact ID-bound forms.
+pub fn validate_blob_storage_relpath(id: &str, relative: &str) -> Result<(), AppError> {
+    let portable = blob_storage_relpath(id)?;
+    if relative != portable && relative != format!("blobs\\{id}.dvb") {
+        return Err(AppError::new(ErrorCode::UnsupportedVaultVersion));
+    }
+    Ok(())
 }
 
 /// A verification-only sink. Plaintext never escapes or becomes a filesystem copy.
@@ -407,11 +421,11 @@ impl Vault {
         let (hash, size, relative, version): (String, i64, String, u32) = db.query_row(
             "SELECT sha256_hex,size_bytes,storage_relpath,crypto_format_version FROM blobs WHERE id=?1", [id],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|error| db_error(&error))?;
-        let expected_path = blob_relative(id)?;
-        if Path::new(&relative) != expected_path || version != 1 {
+        validate_blob_storage_relpath(id, &relative)?;
+        if version != 1 {
             return Err(AppError::new(ErrorCode::UnsupportedVaultVersion));
         }
-        let path = self.root.join(expected_path);
+        let path = self.root.join(blob_storage_relpath(id)?);
         let metadata = fs::symlink_metadata(&path).map_err(|error| blob_io_error(&error))?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(AppError::new(ErrorCode::BlobAuthFailed));
@@ -640,7 +654,7 @@ impl ImportRepository for Vault {
             fs::remove_file(&staged.staging_path).map_err(|error| io_error(&error))?;
             (id, false)
         } else {
-            let canonical = self.root.join(blob_relative(&candidate_id)?);
+            let canonical = self.root.join(blob_storage_relpath(&candidate_id)?);
             if canonical.exists() {
                 return Err(AppError::new(ErrorCode::Internal));
             }
@@ -663,7 +677,7 @@ impl ImportRepository for Vault {
         let tx = db.transaction().map_err(|error| db_error(&error))?;
         if new_blob {
             tx.execute("INSERT INTO blobs(id,sha256_hex,size_bytes,storage_relpath,crypto_format_version,created_at,verified_at) VALUES (?1,?2,?3,?4,1,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                params![blob_id, staged.sha256_hex, i64::try_from(staged.size_bytes).map_err(|_| AppError::new(ErrorCode::Internal))?, blob_relative(&blob_id)?.to_string_lossy()]).map_err(|error| db_error(&error))?;
+                params![blob_id, staged.sha256_hex, i64::try_from(staged.size_bytes).map_err(|_| AppError::new(ErrorCode::Internal))?, blob_storage_relpath(&blob_id)?]).map_err(|error| db_error(&error))?;
         }
         let item_id = Uuid::new_v4().to_string();
         tx.execute("INSERT INTO items(id,kind,source_name,source_path_hint,created_at,updated_at,status) VALUES (?1,'FILE',?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'),'IMPORTED')", params![item_id, staged.source_name, staged.source_path_hint]).map_err(|error| db_error(&error))?;
