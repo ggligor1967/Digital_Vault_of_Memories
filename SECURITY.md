@@ -2,8 +2,11 @@
 
 ## Current scope
 
-G0 and G1 are CLOSED. G2 security and key lifecycle is current; acceptance is
-recorded in [G2 evidence](docs/release-evidence/G2-SECURITY-KEY-LIFECYCLE.md).
+G0-G3 are CLOSED. G3 backup, restore and migration trusted APIs are implemented
+and verified; see [G3 closure evidence](docs/release-evidence/G3-RECOVERY-BACKUP-MIGRATION-CLOSURE.md).
+G2 acceptance is recorded in [G2 evidence](docs/release-evidence/G2-SECURITY-KEY-LIFECYCLE.md).
+G4 and later gates are not started. G4 requires PR #3 to merge, post-merge
+verification to pass, and a separate explicit admission.
 Implementation is not a release-readiness claim. The desktop currently exposes
 only foundation status. Production security mechanisms are trusted Rust APIs;
 there is no vault creation/recovery presentation UI.
@@ -115,7 +118,12 @@ credential because the OS store and header cannot activate atomically together.
 This does not remove the independent passphrase/recovery paths. Header crash
 tests use an in-memory credential store; real OS tests explicitly clean up.
 
-G3 backup, restore and migration are not implemented. Search, AI/networking,
+G3 backups contain an encrypted SQLCipher snapshot and unchanged encrypted DVB1
+blobs. An authenticated encrypted manifest binds the archive; FULL verification
+decrypts every canonical blob before restore activation. The device credential
+store is excluded, so passphrase/recovery material must be retained separately.
+See [recovery operations](docs/recovery.md) and [DVBK1](docs/formats/DVBK1.md).
+Search, AI/networking,
 media pipelines, plugins, mobile, sync and release hardening remain later gates.
 Dependency scans, SBOM, signing and coordinated disclosure are G6 requirements.
 

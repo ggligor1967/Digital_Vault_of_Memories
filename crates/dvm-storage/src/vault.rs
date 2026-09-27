@@ -23,13 +23,65 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Releases the advisory lock before an inherited or duplicated handle can
+/// extend an owner's lifetime after this owner is dropped.
+pub(crate) struct FileLockOwner(File);
+
+impl FileLockOwner {
+    pub(crate) fn try_acquire(file: File) -> Result<Self, AppError> {
+        file.try_lock()
+            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        #[cfg(test)]
+        Self::capture_duplicate_for_test(&file);
+        Ok(Self(file))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate_handle_for_test(&self) -> std::io::Result<File> {
+        self.0.try_clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_duplicate_for_test() {
+        DUPLICATE_NEXT_LOCK.with(|armed| armed.set(true));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_duplicate_for_test() -> Option<File> {
+        DUPLICATED_LOCK.with(|duplicate| duplicate.borrow_mut().take())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_duplicate_for_test(file: &File) {
+        if DUPLICATE_NEXT_LOCK.with(std::cell::Cell::take) {
+            DUPLICATED_LOCK.with(|duplicate| *duplicate.borrow_mut() = file.try_clone().ok());
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DUPLICATE_NEXT_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DUPLICATED_LOCK: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static OPEN_AFTER_OWNER_LOCK_FAULT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+impl Drop for FileLockOwner {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Exclusive trusted vault owner. Share it through `Arc` for concurrent imports.
 /// The OS lock blocks competing processes and concurrent startup reconciliation.
 pub struct Vault {
     pub(crate) root: PathBuf,
     pub(crate) database: Mutex<Connection>,
     pub(crate) blob_root: BlobRootKey,
-    _ownership: File,
+    // Retained for its Drop behavior after the database connection closes.
+    #[allow(dead_code)]
+    owner_lock: FileLockOwner,
     /// Safe native cipher initialization evidence.
     pub cipher: CipherEvidence,
     /// Reconciliation performed before this instance admits writes.
@@ -47,6 +99,7 @@ pub(crate) fn io_error(error: &std::io::Error) -> AppError {
         ErrorCode::Internal
     })
 }
+
 /// Classifies a failure to reach a canonical blob.
 ///
 /// Only a genuinely absent file is `MissingBlob`: that code asserts canonical
@@ -152,9 +205,23 @@ pub(crate) fn uuid_bytes(id: &str) -> Result<[u8; 16], AppError> {
     }
     Ok(*parsed.as_bytes())
 }
-pub(crate) fn blob_relative(id: &str) -> Result<PathBuf, AppError> {
+/// Portable database spelling of a canonical blob's relative path.
+/// # Errors
+/// Rejects IDs that are not canonical lowercase hyphenated UUIDs.
+pub fn blob_storage_relpath(id: &str) -> Result<String, AppError> {
     uuid_bytes(id)?;
-    Ok(PathBuf::from("blobs").join(format!("{id}.dvb")))
+    Ok(format!("blobs/{id}.dvb"))
+}
+
+/// Validates portable or historical Windows metadata independently of the host OS.
+/// # Errors
+/// Rejects invalid IDs and every spelling except the two exact ID-bound forms.
+pub fn validate_blob_storage_relpath(id: &str, relative: &str) -> Result<(), AppError> {
+    let portable = blob_storage_relpath(id)?;
+    if relative != portable && relative != format!("blobs\\{id}.dvb") {
+        return Err(AppError::new(ErrorCode::UnsupportedVaultVersion));
+    }
+    Ok(())
 }
 
 /// A verification-only sink. Plaintext never escapes or becomes a filesystem copy.
@@ -170,6 +237,11 @@ impl PlaintextSink for VerifyOnly {
 }
 
 impl Vault {
+    #[cfg(test)]
+    pub(crate) fn duplicate_owner_lock_for_test(&self) -> std::io::Result<File> {
+        self.owner_lock.duplicate_handle_for_test()
+    }
+
     /// Creates only a trusted injected-key integration vault with no usable keyslot.
     /// No production UI/IPC calls this API. G2 must supply durable wrapped keys.
     /// # Errors
@@ -191,9 +263,7 @@ impl Vault {
             .create_new(true)
             .open(root.join("local-state/owner.lock"))
             .map_err(|error| io_error(&error))?;
-        ownership
-            .try_lock()
-            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        let owner_lock = FileLockOwner::try_acquire(ownership)?;
         let mut header = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -213,7 +283,7 @@ impl Vault {
             root,
             database: Mutex::new(db),
             blob_root,
-            _ownership: ownership,
+            owner_lock,
             cipher,
             reconciliation: healthy_report(),
             repair_required: AtomicBool::new(false),
@@ -258,16 +328,18 @@ impl Vault {
             .write(true)
             .open(root.join("local-state/owner.lock"))
             .map_err(|error| io_error(&error))?;
-        ownership
-            .try_lock()
-            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        let owner_lock = FileLockOwner::try_acquire(ownership)?;
+        #[cfg(test)]
+        if OPEN_AFTER_OWNER_LOCK_FAULT.with(std::cell::Cell::take) {
+            return Err(AppError::new(ErrorCode::Internal));
+        }
         let (db_key, blob_root) = key.storage_keys()?;
         let (db, cipher) = database::open(&root.join("metadata.db"), &db_key, false)?;
         let mut vault = Self {
             root,
             database: Mutex::new(db),
             blob_root,
-            _ownership: ownership,
+            owner_lock,
             cipher,
             reconciliation: healthy_report(),
             repair_required: AtomicBool::new(false),
@@ -378,11 +450,11 @@ impl Vault {
         let (hash, size, relative, version): (String, i64, String, u32) = db.query_row(
             "SELECT sha256_hex,size_bytes,storage_relpath,crypto_format_version FROM blobs WHERE id=?1", [id],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(|error| db_error(&error))?;
-        let expected_path = blob_relative(id)?;
-        if Path::new(&relative) != expected_path || version != 1 {
+        validate_blob_storage_relpath(id, &relative)?;
+        if version != 1 {
             return Err(AppError::new(ErrorCode::UnsupportedVaultVersion));
         }
-        let path = self.root.join(expected_path);
+        let path = self.root.join(blob_storage_relpath(id)?);
         let metadata = fs::symlink_metadata(&path).map_err(|error| blob_io_error(&error))?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(AppError::new(ErrorCode::BlobAuthFailed));
@@ -611,7 +683,7 @@ impl ImportRepository for Vault {
             fs::remove_file(&staged.staging_path).map_err(|error| io_error(&error))?;
             (id, false)
         } else {
-            let canonical = self.root.join(blob_relative(&candidate_id)?);
+            let canonical = self.root.join(blob_storage_relpath(&candidate_id)?);
             if canonical.exists() {
                 return Err(AppError::new(ErrorCode::Internal));
             }
@@ -634,7 +706,7 @@ impl ImportRepository for Vault {
         let tx = db.transaction().map_err(|error| db_error(&error))?;
         if new_blob {
             tx.execute("INSERT INTO blobs(id,sha256_hex,size_bytes,storage_relpath,crypto_format_version,created_at,verified_at) VALUES (?1,?2,?3,?4,1,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                params![blob_id, staged.sha256_hex, i64::try_from(staged.size_bytes).map_err(|_| AppError::new(ErrorCode::Internal))?, blob_relative(&blob_id)?.to_string_lossy()]).map_err(|error| db_error(&error))?;
+                params![blob_id, staged.sha256_hex, i64::try_from(staged.size_bytes).map_err(|_| AppError::new(ErrorCode::Internal))?, blob_storage_relpath(&blob_id)?]).map_err(|error| db_error(&error))?;
         }
         let item_id = Uuid::new_v4().to_string();
         tx.execute("INSERT INTO items(id,kind,source_name,source_path_hint,created_at,updated_at,status) VALUES (?1,'FILE',?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'),'IMPORTED')", params![item_id, staged.source_name, staged.source_path_hint]).map_err(|error| db_error(&error))?;

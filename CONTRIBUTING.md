@@ -2,11 +2,11 @@
 
 ## The one rule that shapes everything else
 
-Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. G0 and G1 are CLOSED. The current gate is **G2 — security and key lifecycle**.
+Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. G0-G3 are CLOSED. G4 is NOT STARTED and NOT AUTHORIZED. G3 closure alone does not admit next-gate implementation; PR #3 must be merged, post-merge verification must pass, and G4 needs a separate explicit admission.
 
 This is not process for its own sake. Blueprint v2 replaced an architecture that made guarantees it could not keep, and it did so by ordering the work so that correctness, security and recoverability are proven _before_ the features that depend on them. A change that implements part of G1 while G0 is open does not accelerate anything; it removes the evidence that G0 was ever true.
 
-G2 additionally authorizes the exactly pinned Argon2id and native Windows credential adapters documented in ADR-0006 through ADR-0009. AI/model providers, HNSW/search, FFmpeg/media, backup/archive and plugin frameworks remain prohibited. Provider-secret storage grants no network authority.
+G2 authorized the exactly pinned Argon2id and native Windows credential adapters documented in ADR-0006 through ADR-0009. G3 adds only the pinned tar container and Windows no-replace activation adapter described in ADR-0013 and ADR-0014. AI/model providers, HNSW/search, FFmpeg/media and plugin frameworks remain prohibited. Provider-secret storage grants no network authority.
 
 Before direct Cargo commands, run `node scripts/prepare-sodium.mjs` on Windows x64.
 All repository gates run this prerequisite automatically. It verifies the pinned
@@ -45,10 +45,10 @@ Toolchain versions are pinned in `.node-version`, the `packageManager` field, an
 ## Before you push
 
 ```powershell
-pnpm verify:g2
+pnpm verify:g3
 ```
 
-That runs every gate check in order and prints each command with its exact exit code. It is the same script CI runs, so a green run locally means a green run in CI for everything except the platform matrix.
+On the G3 branch, that runs the G3 verification gate and prints each command with its exact exit code. Its CI workflow runs `pnpm verify:g3 --ci`, which uses CI mode and the platform matrix. No G4 workflow is admitted yet.
 
 If you only touched the renderer, the fast loop is:
 
@@ -103,7 +103,7 @@ Two rules about evidence are worth stating plainly, because both are easy to vio
 - **Screenshots are not evidence** for storage, security or recovery correctness. They can supplement a command transcript; they cannot replace one.
 - **A successful compile is not runtime proof.** Where a gate requires runtime behaviour, it requires a captured, mechanical observation of that behaviour — for G0, that is `pnpm runtime:evidence`.
 
-Do not report `PASS` for a step you skipped. `pnpm verify:g2` reports skipped steps as skipped for exactly this reason.
+Do not report `PASS` for a step you skipped. `pnpm verify:g3` reports skipped steps as skipped for exactly this reason.
 
 ## Closed G1 acceptance history
 
@@ -130,3 +130,11 @@ API decision. A renderer presentation workaround is not authorized.
 Candidate publication requires local and exact-source clean-room PASS. After
 clean-room proof, only the evidence document may be amended before publication.
 G2 must not be merged or advance G3 in the implementation transaction.
+
+## G3 recovery evidence
+
+Run `pnpm verify:g3` before a candidate. A fresh short-path clone must pass
+`pnpm install --frozen-lockfile` and `pnpm verify:g3 --cleanroom`. Only the G3
+evidence document may change after that source proof. Keep backups outside the
+source vault, use FULL verification before calling one restorable, and never
+overwrite a restore destination. See [recovery operations](docs/recovery.md).

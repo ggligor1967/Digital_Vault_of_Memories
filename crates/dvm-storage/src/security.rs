@@ -59,7 +59,23 @@ pub struct OpenVault {
     vault: Vault,
     vmk: VaultMasterKey,
     credentials: Arc<dyn CredentialStore>,
-    _keyslot_ownership: File,
+    // Retained for its Drop behavior after the vault owner closes.
+    #[allow(dead_code)]
+    keyslot_lock: crate::vault::FileLockOwner,
+}
+
+/// Trusted backend only. Key types have no renderer serialization or debug output.
+pub struct BackupAccess {
+    /// Canonical source vault root.
+    pub root: PathBuf,
+    /// Parsed header bytes from one atomic header generation.
+    pub header: Vec<u8>,
+    /// Key for the encrypted DB snapshot.
+    pub db_key: dvm_crypto::DbKey,
+    /// Per-blob decryption root for FULL verification.
+    pub blob_root: dvm_crypto::BlobRootKey,
+    /// G2-derived backup secret; not serialized into the archive.
+    pub backup_key: dvm_crypto::keys::BackupKey,
 }
 
 fn read_header(root: &Path) -> Result<VaultHeader, AppError> {
@@ -78,6 +94,36 @@ fn read_header(root: &Path) -> Result<VaultHeader, AppError> {
         .read_to_end(&mut bytes)
         .map_err(|e| io_error(&e))?;
     header::parse(&bytes)
+}
+
+/// Unlocks an archived header using a trusted passphrase or recovery secret.
+/// Device credentials are intentionally excluded from portable recovery.
+/// # Errors
+/// Malformed headers and invalid credentials fail closed.
+pub fn unlock_backup_header(
+    bytes: &[u8],
+    credential: &UnlockCredential,
+) -> Result<VaultMasterKey, AppError> {
+    let envelope = header::parse(bytes)?;
+    let kind = match credential {
+        UnlockCredential::Passphrase(_) => "passphrase-v1",
+        UnlockCredential::Recovery(_) => "recovery-v1",
+        UnlockCredential::Device => return Err(AppError::new(ErrorCode::ProviderUnavailable)),
+    };
+    let slot = envelope
+        .keyslots
+        .iter()
+        .find(|slot| slot.slot_type == kind)
+        .ok_or_else(|| AppError::new(ErrorCode::BadPassphrase))?;
+    match credential {
+        UnlockCredential::Passphrase(passphrase) => {
+            keyslots::unwrap_passphrase(&envelope.vault_id, slot, passphrase)
+        }
+        UnlockCredential::Recovery(secret) => {
+            keyslots::unwrap_recovery(&envelope.vault_id, slot, secret)
+        }
+        UnlockCredential::Device => Err(AppError::new(ErrorCode::ProviderUnavailable)),
+    }
 }
 
 #[cfg(test)]
@@ -264,9 +310,7 @@ impl SessionBackend for ProtectedVault {
             .write(true)
             .open(self.root.join("local-state/keyslots.lock"))
             .map_err(|e| io_error(&e))?;
-        ownership
-            .try_lock()
-            .map_err(|_| AppError::new(ErrorCode::VaultLocked))?;
+        let keyslot_lock = crate::vault::FileLockOwner::try_acquire(ownership)?;
         let envelope = read_header(&self.root)?;
         // One selection boundary for every credential kind: the slot type it
         // requires, and the classification for that slot being absent. A vault
@@ -319,7 +363,7 @@ impl SessionBackend for ProtectedVault {
             vault,
             vmk,
             credentials: Arc::clone(&self.credentials),
-            _keyslot_ownership: ownership,
+            keyslot_lock,
         })
     }
     fn health(active: &OpenVault) -> ReconciliationHealth {
@@ -328,6 +372,40 @@ impl SessionBackend for ProtectedVault {
 }
 
 impl OpenVault {
+    /// Records a verified archive only after its activation; failure leaves the archive valid.
+    /// # Errors
+    /// Bookkeeping failure is returned without claiming that an activated archive vanished.
+    pub fn record_backup_activation(&self, backup_id: &str) -> Result<(), AppError> {
+        let db = self.vault.writable_db()?;
+        db.execute(
+            "INSERT INTO backup_history(backup_id,format_version,schema_version,destination_hint,verification_mode,status,created_at,verified_at) VALUES (?1,1,2,NULL,'FULL','VERIFIED',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            [backup_id],
+        ).map_err(|error| crate::database::db_error(&error))?;
+        Ok(())
+    }
+    /// Canonical source root for trusted backup placement checks.
+    #[must_use]
+    pub fn root_for_backup(&self) -> &Path {
+        &self.vault.root
+    }
+    /// Makes an encrypted online snapshot and returns trusted keys for DVBK1.
+    /// Canonical DB writes are serialized by the existing vault mutex during copy.
+    /// # Errors
+    /// Refuses an existing snapshot path or an unhealthy vault.
+    pub fn snapshot_for_backup(&self, destination: &Path) -> Result<BackupAccess, AppError> {
+        let database = self.vault.writable_db()?;
+        let (db_key, blob_root) = self.vmk.storage_keys()?;
+        let (_, backup_key) = self.vmk.auxiliary_keys()?;
+        let header = header::serialize(&read_header(&self.vault.root)?)?;
+        crate::database::snapshot_encrypted(&database, destination, &db_key)?;
+        Ok(BackupAccess {
+            root: self.vault.root.clone(),
+            header,
+            db_key,
+            blob_root,
+            backup_key,
+        })
+    }
     /// Best-effort removal of a credential no authoritative header references.
     ///
     /// Cleanup is secondary evidence only: the caller keeps the primary

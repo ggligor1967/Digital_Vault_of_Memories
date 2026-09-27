@@ -497,8 +497,11 @@ const ACTIVATION_MATRIX: [(&str, bool); 6] = [
 fn header_failure_matrix_separates_pre_and_post_activation() -> TestResult {
     for (point, activated) in ACTIVATION_MATRIX {
         let f = Fixture::new()?;
-        let (backend, recovery) = create(&f, Arc::new(MemoryStore::default()))?;
-        let active = backend.unlock(&input("original phrase")?)?;
+        let (backend, recovery) = create(&f, Arc::new(MemoryStore::default()))
+            .map_err(|error| format!("{point}: create: {error}"))?;
+        let active = backend
+            .unlock(&input("original phrase")?)
+            .map_err(|error| format!("{point}: initial passphrase unlock: {error}"))?;
         let source = f.base.join("private matrix.dat");
         fs::write(&source, b"private canonical matrix bytes")?;
         let receipt = active.import(&source)?;
@@ -534,7 +537,9 @@ fn header_failure_matrix_separates_pre_and_post_activation() -> TestResult {
                 "{point}: header did not activate"
             );
             assert!(backend.unlock(&input("original phrase")?).is_err());
-            let reopened = backend.unlock(&input("new phrase")?)?;
+            let reopened = backend
+                .unlock(&input("new phrase")?)
+                .map_err(|error| format!("{point}: new passphrase unlock: {error}"))?;
             assert!(vmk.as_bytes() == reopened.vmk.storage_keys()?.0.as_bytes());
             let mut sink = Sink::default();
             reopened.recover(&receipt.blob_id, &mut sink)?;
@@ -545,13 +550,123 @@ fn header_failure_matrix_separates_pre_and_post_activation() -> TestResult {
             assert_eq!(failure.primary().code, ErrorCode::Internal);
             assert_eq!(*failure.cleanup(), CleanupOutcome::NotRequired);
             assert!(before == fs::read(f.root().join("vault.header"))?);
-            drop(backend.unlock(&input("original phrase")?)?);
+            drop(
+                backend
+                    .unlock(&input("original phrase")?)
+                    .map_err(|error| format!("{point}: old passphrase unlock: {error}"))?,
+            );
             assert!(backend.unlock(&input("new phrase")?).is_err());
         }
         assert!(blobs == snapshot(&f.root().join("blobs"))?);
-        drop(backend.unlock(&UnlockCredential::Recovery(recovery))?);
+        drop(
+            backend
+                .unlock(&UnlockCredential::Recovery(recovery))
+                .map_err(|error| format!("{point}: recovery unlock: {error}"))?,
+        );
     }
     println!("H1_HEADER_ACTIVATION_MATRIX=PASS H1_PASSPHRASE_COMMIT=PASS");
+    Ok(())
+}
+
+#[test]
+fn keyslot_lock_releases_when_owner_drops_even_if_handle_was_duplicated() -> TestResult {
+    let fixture = Fixture::new()?;
+    let (backend, _) = create(&fixture, Arc::new(MemoryStore::default()))?;
+    let active = backend.unlock(&input("original phrase")?)?;
+    let inherited_handle = active.keyslot_lock.duplicate_handle_for_test()?;
+    assert_eq!(
+        backend
+            .unlock(&input("original phrase")?)
+            .err()
+            .ok_or("second keyslot owner admitted")?
+            .code,
+        ErrorCode::VaultLocked
+    );
+    drop(active);
+    drop(backend.unlock(&input("original phrase")?)?);
+    drop(inherited_handle);
+    Ok(())
+}
+
+#[test]
+fn failed_unlock_releases_keyslot_lock_before_next_credential() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = Arc::new(MemoryStore::default());
+    let created = ProtectedVault::create_with_policy(
+        &fixture.root(),
+        &pass("original phrase")?,
+        RecoveryPolicy::DeclinedAfterDataLossWarning,
+        ArgonProfile::BASELINE,
+        store.clone(),
+    )
+    .map_err(NotActivated::into_primary)?
+    .into_value();
+    let before = snapshot(&fixture.root())?;
+    for _ in 0..100 {
+        assert_eq!(
+            created
+                .backend
+                .unlock(&UnlockCredential::Recovery(RecoverySecret::generate()?))
+                .err()
+                .ok_or("missing recovery slot admitted")?
+                .code,
+            ErrorCode::BadPassphrase
+        );
+        assert_eq!(
+            created
+                .backend
+                .unlock(&UnlockCredential::Device)
+                .err()
+                .ok_or("missing device slot admitted")?
+                .code,
+            ErrorCode::ProviderUnavailable
+        );
+    }
+    assert_eq!(before, snapshot(&fixture.root())?);
+    assert!(
+        store
+            .0
+            .lock()
+            .map_err(|_| "credential store lock poisoned")?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_unlock_releases_lock_while_duplicate_handle_survives() -> TestResult {
+    let fixture = Fixture::new()?;
+    let created = ProtectedVault::create_with_policy(
+        &fixture.root(),
+        &pass("original phrase")?,
+        RecoveryPolicy::DeclinedAfterDataLossWarning,
+        ArgonProfile::BASELINE,
+        Arc::new(MemoryStore::default()),
+    )
+    .map_err(NotActivated::into_primary)?
+    .into_value();
+    crate::vault::FileLockOwner::arm_duplicate_for_test();
+    assert_eq!(
+        created
+            .backend
+            .unlock(&UnlockCredential::Recovery(RecoverySecret::generate()?))
+            .err()
+            .ok_or("missing recovery slot admitted")?
+            .code,
+        ErrorCode::BadPassphrase
+    );
+    let inherited_handle = crate::vault::FileLockOwner::take_duplicate_for_test()
+        .ok_or("keyslot lock was not duplicated after acquisition")?;
+    assert_eq!(
+        created
+            .backend
+            .unlock(&UnlockCredential::Device)
+            .err()
+            .ok_or("missing device slot admitted")?
+            .code,
+        ErrorCode::ProviderUnavailable
+    );
+    drop(inherited_handle);
     Ok(())
 }
 
@@ -944,8 +1059,11 @@ fn device_enrollment_retains_the_credential_it_activated() -> TestResult {
     for (point, activated) in ACTIVATION_MATRIX {
         let f = Fixture::new()?;
         let store = Arc::new(FaultStore::default());
-        let (backend, recovery) = create(&f, store.clone())?;
-        let active = backend.unlock(&input("original phrase")?)?;
+        let (backend, recovery) =
+            create(&f, store.clone()).map_err(|error| format!("{point}: create: {error}"))?;
+        let active = backend
+            .unlock(&input("original phrase")?)
+            .map_err(|error| format!("{point}: initial passphrase unlock: {error}"))?;
         let before = fs::read(f.root().join("vault.header"))?;
         UPDATE_FAULT.with(|c| c.set(Some(point)));
         let result = active.enable_device();
@@ -967,7 +1085,11 @@ fn device_enrollment_retains_the_credential_it_activated() -> TestResult {
                 vec![reference],
                 "{point}: the activated credential was deleted"
             );
-            drop(backend.unlock(&UnlockCredential::Device)?);
+            drop(
+                backend
+                    .unlock(&UnlockCredential::Device)
+                    .map_err(|error| format!("{point}: device unlock: {error}"))?,
+            );
         } else {
             let failure = result.err().ok_or("pre-activation failure expected")?;
             assert_eq!(failure.primary().code, ErrorCode::Internal);
@@ -980,8 +1102,16 @@ fn device_enrollment_retains_the_credential_it_activated() -> TestResult {
             );
             assert!(backend.unlock(&UnlockCredential::Device).is_err());
         }
-        drop(backend.unlock(&input("original phrase")?)?);
-        drop(backend.unlock(&UnlockCredential::Recovery(recovery))?);
+        drop(
+            backend
+                .unlock(&input("original phrase")?)
+                .map_err(|error| format!("{point}: passphrase unlock: {error}"))?,
+        );
+        drop(
+            backend
+                .unlock(&UnlockCredential::Recovery(recovery))
+                .map_err(|error| format!("{point}: recovery unlock: {error}"))?,
+        );
     }
     println!("H1_DEVICE_ACTIVATION_MATRIX=PASS");
     Ok(())
@@ -1398,13 +1528,28 @@ fn post_write_persistence_failure_removes_the_credential_it_wrote() -> TestResul
 
     // Control: a write whose verification passes persists and compensates nothing.
     post_write_seam::reset();
-    WindowsCredentialStore.store(&reference, &secret)?;
-    assert!(present(&WindowsCredentialStore.retrieve(&reference)?));
+    WindowsCredentialStore.store(&reference, &secret).map_err(|error| {
+        let (stage, compensation_failed) =
+            crate::credentials::take_store_failure_diagnostic();
+        format!(
+            "W1_POST_WRITE_CONTROL_STORE_STAGE={stage:?} W1_POST_WRITE_COMPENSATION_FAILED={compensation_failed} W1_PRIMARY={:?}",
+            error.code
+        )
+    })?;
+    assert!(present(
+        &WindowsCredentialStore
+            .retrieve(&reference)
+            .map_err(|error| {
+                format!("W1_POST_WRITE_CONTROL_RETRIEVE_PRIMARY={:?}", error.code)
+            })?
+    ));
     assert!(
         post_write_seam::last_compensation().is_none(),
         "a verified write removed its own credential"
     );
-    WindowsCredentialStore.delete(&reference)?;
+    WindowsCredentialStore
+        .delete(&reference)
+        .map_err(|error| format!("W1_POST_WRITE_CONTROL_DELETE_PRIMARY={:?}", error.code))?;
 
     // Post-write verification fails after set_secret has already persisted the
     // credential. Production must remove exactly what it just wrote.
@@ -1778,7 +1923,15 @@ fn zero_length_stored_device_credential_is_classified_and_re_enrolled() -> TestR
     fs::write(&source, b"private canonical device bytes")?;
     let receipt = active.import(&source)?;
     let vmk = active.vmk.storage_keys()?.0;
-    assert!(active.enable_device()?.is_fully_settled());
+    let enrollment = active.enable_device().map_err(|failure| {
+        let (stage, compensation_failed) =
+            crate::credentials::take_store_failure_diagnostic();
+        format!(
+            "W1_INITIAL_ENROLLMENT_STAGE={stage:?} W1_POST_WRITE_COMPENSATION_FAILED={compensation_failed} W1_PRIMARY={:?}",
+            failure.primary().code
+        )
+    })?;
+    assert!(enrollment.is_fully_settled());
     let first = device_reference(&f.root())?.ok_or("device slot")?;
     let intact = fs::read(f.root().join("vault.header"))?;
     let blobs = snapshot(&f.root().join("blobs"))?;
