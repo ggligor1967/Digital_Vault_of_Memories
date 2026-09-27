@@ -2,7 +2,10 @@
 
 A local-first desktop application for importing, preserving, organising, searching and exporting personal digital memories — photographs, videos, audio, documents and text — with the original bytes treated as more important than anything derived from them.
 
-**Status: G0 CLOSED; G1 CLOSED; G2 CLOSED; G3 recovery, backup and migration is the current implementation candidate. This is not yet a usable product.**
+**Status: G0-G3 CLOSED; G4-G6 NOT STARTED. This is not yet a usable product.**
+
+G4 is not authorized by G3 closure. PR #3 must be merged into main, post-merge
+verification must pass, and a separate G4 admission must be explicitly authorized.
 
 The desktop shell currently exposes only foundation status. Trusted Rust APIs now
 implement production passphrase/recovery/device keyslots and a guarded vault
@@ -13,15 +16,15 @@ and schema migration; G4+ features are not started.
 See the [G2 threat model](docs/threat-model/THREAT-MODEL.md) and
 [G2 evidence](docs/release-evidence/G2-SECURITY-KEY-LIFECYCLE.md) for verified scope.
 
-| Gate   | Scope                                                                                     | State                 |
-| ------ | ----------------------------------------------------------------------------------------- | --------------------- |
-| **G0** | Repository foundation: workspace, lockfiles, Tauri 2 shell, typed IPC, error envelope, CI | **closed**            |
-| **G1** | Zero-loss vault storage                                                                   | **closed**            |
-| G2     | Security and key lifecycle                                                                | **closed**            |
-| G3     | Recovery, backup, migration                                                               | **current candidate** |
-| G4     | Deterministic search                                                                      | not started           |
-| G5     | AI provider layer                                                                         | not started           |
-| G6     | Product hardening / release candidate                                                     | not started           |
+| Gate   | Scope                                                                                     | State       |
+| ------ | ----------------------------------------------------------------------------------------- | ----------- |
+| **G0** | Repository foundation: workspace, lockfiles, Tauri 2 shell, typed IPC, error envelope, CI | **closed**  |
+| **G1** | Zero-loss vault storage                                                                   | **closed**  |
+| G2     | Security and key lifecycle                                                                | **closed**  |
+| G3     | Recovery, backup, migration                                                               | **closed**  |
+| G4     | Deterministic search                                                                      | not started |
+| G5     | AI provider layer                                                                         | not started |
+| G6     | Product hardening / release candidate                                                     | not started |
 
 ## Why the architecture looks like this
 

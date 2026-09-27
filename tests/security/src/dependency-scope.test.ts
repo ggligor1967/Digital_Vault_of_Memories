@@ -151,7 +151,9 @@ describe('dependency scope', () => {
     for (const { manifest, name } of allDependencies) {
       for (const { fragment, gate } of LATER_GATE_DEPENDENCIES) {
         if (matchesFragment(name, fragment)) {
-          violations.push(`${manifest}: "${name}" is ${gate} scope, but G3 is the current gate`);
+          violations.push(
+            `${manifest}: "${name}" is ${gate} scope but is not admitted by the current dependency policy`,
+          );
         }
       }
     }

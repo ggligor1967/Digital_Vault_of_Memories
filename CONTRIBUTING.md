@@ -2,7 +2,7 @@
 
 ## The one rule that shapes everything else
 
-Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. G0, G1, and G2 are CLOSED. The current gate is **G3 — recovery, backup and migration**.
+Work happens **one gate at a time**, in the order fixed by [`Digital_Vault_of_Memories_Blueprint_v2.md`](Digital_Vault_of_Memories_Blueprint_v2.md) §36. G0-G3 are CLOSED. G4 is NOT STARTED and NOT AUTHORIZED. G3 closure alone does not admit next-gate implementation; PR #3 must be merged, post-merge verification must pass, and G4 needs a separate explicit admission.
 
 This is not process for its own sake. Blueprint v2 replaced an architecture that made guarantees it could not keep, and it did so by ordering the work so that correctness, security and recoverability are proven _before_ the features that depend on them. A change that implements part of G1 while G0 is open does not accelerate anything; it removes the evidence that G0 was ever true.
 
@@ -48,7 +48,7 @@ Toolchain versions are pinned in `.node-version`, the `packageManager` field, an
 pnpm verify:g3
 ```
 
-That runs the current local G3 gate and prints each command with its exact exit code. CI runs `pnpm verify:g3 --ci`, which uses CI mode and the platform matrix.
+On the G3 branch, that runs the G3 verification gate and prints each command with its exact exit code. Its CI workflow runs `pnpm verify:g3 --ci`, which uses CI mode and the platform matrix. No G4 workflow is admitted yet.
 
 If you only touched the renderer, the fast loop is:
 

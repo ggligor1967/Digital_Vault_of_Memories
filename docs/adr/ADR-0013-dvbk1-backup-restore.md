@@ -1,6 +1,6 @@
 # ADR-0013: DVBK1 backup, verification, and restore
 
-Status: G3 implementation candidate. Existing ADR identifiers are unchanged.
+Status: accepted G3 design; G3 CLOSED. Existing ADR identifiers are unchanged.
 
 We use a pinned streaming tar implementation as the DVBK1 container, with an exact member whitelist and no extraction of arbitrary paths. The encrypted manifest binds the public-format bytes and every stored member. [DVBK1](../formats/DVBK1.md) specifies the byte-level contract. No compression or network dependency is added.
 

@@ -1,6 +1,6 @@
 # ADR-0014: Ordered checksummed migrations
 
-Status: G3 implementation candidate. Existing ADR identifiers are unchanged.
+Status: accepted G3 design; G3 CLOSED. Existing ADR identifiers are unchanged.
 
 The historical G1 `crates/dvm-storage/src/schema.sql` remains byte-for-byte unchanged and retains its version-1 `g1-bootstrap` checksum interpretation. New migrations are immutable numbered files under `migrations/`. Version 2 is `0002_g3_backup_history.sql`, an additive LOW-risk table. Its exact bytes are SHA-256 hashed at application time and recorded in `schema_migrations`.
 

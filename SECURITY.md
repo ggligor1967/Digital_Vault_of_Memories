@@ -2,8 +2,11 @@
 
 ## Current scope
 
-G0, G1, and G2 are CLOSED. G3 recovery, backup and migration is current; G2 acceptance is
-recorded in [G2 evidence](docs/release-evidence/G2-SECURITY-KEY-LIFECYCLE.md).
+G0-G3 are CLOSED. G3 backup, restore and migration trusted APIs are implemented
+and verified; see [G3 closure evidence](docs/release-evidence/G3-RECOVERY-BACKUP-MIGRATION-CLOSURE.md).
+G2 acceptance is recorded in [G2 evidence](docs/release-evidence/G2-SECURITY-KEY-LIFECYCLE.md).
+G4 and later gates are not started. G4 requires PR #3 to merge, post-merge
+verification to pass, and a separate explicit admission.
 Implementation is not a release-readiness claim. The desktop currently exposes
 only foundation status. Production security mechanisms are trusted Rust APIs;
 there is no vault creation/recovery presentation UI.

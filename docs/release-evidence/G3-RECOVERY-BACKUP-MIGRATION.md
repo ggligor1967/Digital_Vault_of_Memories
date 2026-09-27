@@ -1,6 +1,8 @@
 # DVM-V2 / G3 recovery, backup, migration evidence
 
-Status: implementation candidate. Local and clean-room acceptance passed; remote CI and exact-head reviews are pending. This document does not claim G3 closure.
+Status: G3 CLOSED after source-head CI, final Codex review, ratified bounded Copilot-unavailability exception, resolved material threads, and closure verification. See the [formal G3 closure record](G3-RECOVERY-BACKUP-MIGRATION-CLOSURE.md). The historical candidate evidence below remains as recorded.
+
+Subsequent remediation evidence: [initial hold](G3-HOLD-REMEDIATION-1.md), [P1/P2 portability and conflicts](G3-P1-P2-REMEDIATION.md), [failed-unlock lock lifetime](G3-LOCK-FAILURE-PATH-REMEDIATION.md), and [atomic backup activation](G3-BACKUP-ACTIVATION-REMEDIATION.md). These records retain the status observed at their respective transaction times.
 
 ## Baseline
 
@@ -32,4 +34,4 @@ Fresh clone `C:\dvm-g3-cr` checked out candidate `b963ec4a2616178a259abb27dfe827
 
 During the cold clean-room build, the already-verified source checkout's unused, regenerable `target/release` output (about 1.52 GiB) was removed after checking that no process used it. This did not change source, lockfiles, test vaults, or the clean-room clone.
 
-The final amended source SHA is recorded by Git and the final report. CI run URLs and exact-head reviews are pending. Do not mark remote evidence or G3 closure before those results are observed.
+Historical status at this original evidence transaction: the final amended source SHA was to be recorded by Git and the final report; CI run URLs and exact-head reviews were then pending. This paragraph records that earlier checkpoint, not the present closure state.
