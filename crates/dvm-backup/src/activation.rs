@@ -24,10 +24,19 @@ pub(crate) fn activate_directory_noreplace(staging: &Path, destination: &Path) -
     activate_file_noreplace(staging, destination)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub(crate) fn activate_file_noreplace(staging: &Path, destination: &Path) -> io::Result<()> {
-    std::fs::hard_link(staging, destination)?;
-    std::fs::remove_file(staging)
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, staging, CWD, destination, RenameFlags::NOREPLACE).map_err(Into::into)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+pub(crate) fn activate_file_noreplace(_: &Path, _: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace file activation is unavailable on this target",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -157,25 +166,49 @@ mod tests {
     }
 
     #[test]
-    fn backup_file_activation_preserves_existing_destination() -> TestResult {
+    fn backup_file_activation_has_unambiguous_outcome() -> TestResult {
         let root = TestRoot::new()?;
         let staging = root.path("backup.part");
         let destination = root.path("backup.dvmbak");
-        std::fs::write(&staging, b"staged")?;
+        let verified_bytes = b"verified archive";
+        std::fs::write(&staging, verified_bytes)?;
         std::fs::write(&destination, b"original")?;
-        assert_eq!(
-            activate_file_noreplace(&staging, &destination)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(std::fs::read(&staging)?, b"staged");
+        let error = activate_file_noreplace(&staging, &destination).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&staging)?, verified_bytes);
         assert_eq!(std::fs::read(&destination)?, b"original");
+        println!("BACKUP_ATOMIC_ACTIVATION_CONFLICT=PASS");
+
         std::fs::remove_file(&destination)?;
-        activate_file_noreplace(&staging, &destination)?;
+        let outcome = activate_file_noreplace(&staging, &destination);
+        if outcome.is_err() {
+            assert!(
+                std::fs::symlink_metadata(&destination).is_err(),
+                "activation returned an error after publishing the destination"
+            );
+        }
+        outcome?;
         assert!(!staging.exists());
-        assert_eq!(std::fs::read(&destination)?, b"staged");
-        println!("BACKUP_NOREPLACE_REGRESSION=PASS");
+        assert_eq!(std::fs::read(&destination)?, verified_bytes);
+        println!("BACKUP_ATOMIC_ACTIVATION_SUCCESS=PASS");
+        Ok(())
+    }
+
+    #[test]
+    fn backup_file_activation_preserves_dangling_symlink() -> TestResult {
+        let root = TestRoot::new()?;
+        let staging = root.path("backup.part");
+        let destination = root.path("backup.dvmbak");
+        let missing = root.path("missing");
+        std::fs::write(&staging, b"verified archive")?;
+        symlink(&missing, &destination)?;
+
+        let error = activate_file_noreplace(&staging, &destination).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&staging)?, b"verified archive");
+        assert_eq!(std::fs::read_link(&destination)?, missing);
+        assert!(!missing.exists());
+        println!("BACKUP_DANGLING_SYMLINK=PASS");
         Ok(())
     }
 }

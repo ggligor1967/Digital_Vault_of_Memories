@@ -26,6 +26,19 @@ const cases = [
   ...(process.platform === 'linux'
     ? [
         {
+          name: 'post-publish-file-cleanup-ambiguity',
+          path: activation,
+          mutate: (source) =>
+            replaceOnce(
+              source,
+              'pub(crate) fn activate_file_noreplace(staging: &Path, destination: &Path) -> io::Result<()> {\n    use rustix::fs::{CWD, RenameFlags, renameat_with};\n\n    renameat_with(CWD, staging, CWD, destination, RenameFlags::NOREPLACE).map_err(Into::into)\n}',
+              'pub(crate) fn activate_file_noreplace(staging: &Path, destination: &Path) -> io::Result<()> {\n    std::fs::hard_link(staging, destination)?;\n    let cleanup: io::Result<()> = Err(io::ErrorKind::PermissionDenied.into());\n    cleanup?;\n    std::fs::remove_file(staging)\n}',
+            ),
+          package: 'dvm-backup',
+          test: 'backup_file_activation_has_unambiguous_outcome',
+          expectedFailure: 'activation returned an error after publishing the destination',
+        },
+        {
           name: 'restore-directory-noreplace-regression',
           path: activation,
           mutate: (source) =>
@@ -135,11 +148,18 @@ for (const control of cases) {
       { cwd: root, env: process.env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
     );
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
-    if (result.status !== 101 || !output.includes('test result: FAILED')) {
+    if (
+      result.status !== 101 ||
+      !output.includes('test result: FAILED') ||
+      (control.expectedFailure && !output.includes(control.expectedFailure))
+    ) {
       process.stdout.write(output);
       throw new Error(`${control.name}: expected G3 oracle did not fail`);
     }
     console.log(`G3_NEGATIVE_CONTROL ${control.name}: oracle failed as expected`);
+    if (control.name === 'post-publish-file-cleanup-ambiguity') {
+      console.log('POST_PUBLISH_FAILURE_NEGATIVE_CONTROL=PASS');
+    }
   } catch (error) {
     failure = error;
   } finally {

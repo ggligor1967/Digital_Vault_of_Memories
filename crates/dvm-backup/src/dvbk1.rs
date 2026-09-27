@@ -374,6 +374,7 @@ mod tests {
                 .get::<_, i64>(0))?,
             0
         );
+        println!("BACKUP_ACTIVATION_RACE=PASS");
         Ok(())
     }
 
@@ -391,6 +392,7 @@ mod tests {
         assert_eq!(result.unwrap_err().code, ErrorCode::RestoreConflict);
         assert_eq!(BACKUP_SNAPSHOT_COUNT.get(), snapshots_before);
         assert_eq!(fs::read_link(&destination)?, missing);
+        assert!(!missing.exists());
         assert!(fs::read_dir(&fixture.root)?.all(|entry| {
             !entry
                 .unwrap()
@@ -398,6 +400,7 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".dvm-backup-")
         }));
+        println!("BACKUP_DANGLING_SYMLINK=PASS");
         Ok(())
     }
 
@@ -714,7 +717,7 @@ mod tests {
                 assert_eq!(recorded, i64::from(point == "before_success_response"));
             }
         }
-        println!("G3_BACKUP_CRASH_MATRIX=PASS");
+        println!("G3_BACKUP_CRASH_MATRIX=PASS BACKUP_CRASH_MATRIX=PASS");
         Ok(())
     }
 
